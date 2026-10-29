@@ -217,3 +217,27 @@ DeepSeek 或上次第三方模型作为官方模型。若没有任何官方模�
 回归测试：Windows PowerShell 运行 tests\Test-OfficialSwitch.ps1、
 tests\Test-DamagedSessions.ps1、tests\Test-Reliability.ps1。
 新增可靠性测试使用 Python 标准库 sqlite3 交叉校验数据库；程序运行本身不依赖 Python。
+
+多供应商版（2026-10-29）
+=======================
+本节替代前文“每次切换统一迁移所有旧对话”的旧版说明。
+1. 点击“新增”，填写唯一 ID（小写字母开头，如 mimo）、显示名称、HTTPS base_url、
+   API Key、模型列表（逗号分隔，第一个为默认模型）。可选供应商官方模型能力目录 JSON。
+2. 点击“保存修改”只保存档案；点击“切换到所选供应商”会保存并应用到 Codex。
+3. 下次启动直接在“已保存的供应商”选择。接口、名称、模型和目录均可修改。
+   ID 保存后固定；API Key 留空沿用原密钥，输入新值则更新该供应商密钥。
+4. “获取模型”通过 base_url/models 获取 data[].id。返回列表可以修改、调整顺序；
+   获取失败可以手动填写。成功获取列表不代表 Responses 推理或工具调用已通过验证。
+5. “切换到官方登录”恢复保存的官方根配置，不清空 auth.json 或其它供应商定义。
+6. 默认不改写历史文件。旧对话保留原供应商记录，但具体客户端能否继续使用原路由取决于
+   Codex 版本。需要强制将全部旧会话迁到目标时，勾选“同时迁移全部历史会话”；跨供应商
+   会损失部分推理状态，且目标 API 不一定支持所有旧历史类型。此选项默认关闭。
+7. 旧版 state.json + deepseek.key 会自动导入一个 DeepSeek 档案。旧版只存了最后一家，
+   因此更早被覆盖的其它供应商信息不能凭空恢复。
+
+档案：config.toml 同目录的 codex-switcher/providers.json（密钥为当前用户 DPAPI 密文）。
+生效密钥：codex-switcher/keys/<id>.key；生效模型目录：codex-switcher/catalogs/<id>.json。
+每次应用前保存 profile-backups/<时间-随机ID>/files.json 和对应文件；可选会话备份在 chats/。
+配置、档案、密钥和目录写入失败会尝试一起回滚。运行诊断仍写 runtime.log。
+切换前先退出 Codex；成功后重启。供应商必须支持 Responses API，不是只有 Chat Completions。
+MiMo 等供应商应选用其官方模型能力目录，不要套用 DeepSeek 模板；本工具不会替你推测能力。

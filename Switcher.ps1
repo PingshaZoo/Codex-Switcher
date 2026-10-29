@@ -7,7 +7,7 @@ if ($EmitKey) {
         try { [Console]::Write([Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)) }
         finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
         exit 0
-    } catch { [Console]::Error.WriteLine('Unable to unlock DeepSeek credential. Re-enter the key in Switcher.'); exit 1 }
+    } catch { [Console]::Error.WriteLine('Unable to unlock provider credential. Re-enter the key in Switcher.'); exit 1 }
 }
 $script:SourceScript = $PSCommandPath
 $script:DiagnosticLog = Join-Path $env:LOCALAPPDATA 'Codex-Switcher\logs\runtime.log'
@@ -400,7 +400,7 @@ function Set-RolloutRuntimeFields($Record,[string]$Provider,[string]$Model,[stri
                 Set-ExistingJsonValue $payload.thread_settings 'model' $Model $Stats
                 Set-ExistingJsonValue $payload.thread_settings 'model_provider_id' $Provider $Stats
                 Set-ExistingJsonValue $payload.thread_settings 'reasoning_effort' $Effort $Stats
-                if ($Provider -eq 'deepseek') { Set-ExistingJsonValue $payload.thread_settings 'service_tier' $null $Stats }
+                if ($Provider -ne 'openai') { Set-ExistingJsonValue $payload.thread_settings 'service_tier' $null $Stats }
                 if ($payload.thread_settings.collaboration_mode -and $payload.thread_settings.collaboration_mode.settings) {
                     Set-ExistingJsonValue $payload.thread_settings.collaboration_mode.settings 'model' $Model $Stats
                     Set-ExistingJsonValue $payload.thread_settings.collaboration_mode.settings 'reasoning_effort' $Effort $Stats
@@ -1349,6 +1349,7 @@ function Add-ProviderWatchLog([string]$CodexRoot,$Snapshot) {
     } catch { }
 }
 $script:ManagedKeys += 'web_search'
+. (Join-Path $PSScriptRoot 'ProviderProfiles.ps1')
 if ($LibraryOnly) { return }
 Write-Diagnostic 'INFO' ('Starting Switcher; PowerShell=' + $PSVersionTable.PSVersion)
 
@@ -1356,8 +1357,8 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [Windows.Forms.Application]::EnableVisualStyles()
 $form = New-Object Windows.Forms.Form
-$form.Text = 'Codex 配置切换 — 官方 / DeepSeek'
-$form.ClientSize = New-Object Drawing.Size(690,578)
+$form.Text = 'Codex 多供应商切换'
+$form.ClientSize = New-Object Drawing.Size(690,770)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
@@ -1385,14 +1386,14 @@ $browseConfig=New-Object Windows.Forms.Button
 $browseConfig.Text='选择文件'; $browseConfig.SetBounds(580,43,90,31)
 $browseConfig.Add_Click({ Browse $configBox 'Codex 配置|config.toml' })
 $form.Controls.Add($browseConfig)
-Label '2. DeepSeek 接口地址（仅需首次设置；须支持 Responses API）' 88
+Label '2. 供应商接口地址（须支持 Responses API）' 88
 $baseBox=TextBox 118 'https://api.deepseek.com' 650
-Label '模型名称（DeepSeek：可填多个，逗号分隔，第一个生效｜切回官方：可填目标官方模型名，留空自动识别）' 155
+Label '模型列表（逗号分隔，第一个为默认模型；切官方时可填目标官方模型）' 155
 $modelBox=TextBox 182 'deepseek-v4-flash' 650
 Label 'API Key（首次填写；后续留空沿用已保存密钥；不会显示或写入日志）' 220
 $keyBox=TextBox 248 '' 650
 $keyBox.UseSystemPasswordChar=$true
-Label '模型目录 JSON（新填写的模型会自动写进这个文件；一般不用改）' 285
+Label '模型能力目录 JSON（可选；MiMo 等供应商需选官方提供的目录）' 285
 $catalogBox=TextBox 313 ''
 $browseCatalog=New-Object Windows.Forms.Button
 $browseCatalog.Text='选择文件'; $browseCatalog.SetBounds(580,311,90,31)
@@ -1400,7 +1401,7 @@ $browseCatalog.Add_Click({ Browse $catalogBox '模型目录|*.json' })
 $form.Controls.Add($browseCatalog)
 $notice=New-Object Windows.Forms.Label
 $notice.SetBounds(20,348,650,58)
-$notice.Text="每次切换会备份配置、会话数据库和现有会话文件，不改 auth.json。`r`n所有本地旧对话保留原 ID，并同步续聊路由、兼容字段与派生索引。`r`n切回官方时，旧会话会改用官方模型；官方配置没写 model 时自动取本机 Codex 的官方模型。`r`n可见消息、skills、MCP 均保留；务必先退出 Codex，成功后再重新打开。"
+$notice.Text="默认只切新对话配置；旧会话保留原供应商记录。`r`n勾选迁移会改写全部历史会话，跨供应商可能损失推理状态；务必先退出 Codex。"
 $form.Controls.Add($notice)
 $progress=New-Object Windows.Forms.ProgressBar
 $progress.SetBounds(20,410,650,18)
@@ -1409,7 +1410,7 @@ $form.Controls.Add($progress)
 $officialButton=New-Object Windows.Forms.Button
 $officialButton.Text='切换到官方登录'; $officialButton.SetBounds(20,438,310,49)
 $deepseekButton=New-Object Windows.Forms.Button
-$deepseekButton.Text='切换到 DeepSeek'; $deepseekButton.SetBounds(350,438,320,49)
+$deepseekButton.Text='切换到所选供应商'; $deepseekButton.SetBounds(350,438,320,49)
 $form.Controls.AddRange(@($officialButton,$deepseekButton))
 $status=New-Object Windows.Forms.Label
 $status.SetBounds(20,543,650,25); $form.Controls.Add($status)
@@ -1418,49 +1419,111 @@ $monitorButton.Text='请求去向监测 — 看这个对话到底发给了谁'
 $monitorButton.SetBounds(20,490,650,42)
 $monitorButton.Add_Click({ Show-Monitor })
 $form.Controls.Add($monitorButton)
+# Profile management controls; stable ID is separate from the editable display name.
+Label '已保存的供应商（选择后可修改，保存或切换；密钥留空沿用）' 575
+$profileBox=New-Object Windows.Forms.ComboBox
+$profileBox.SetBounds(20,604,280,30); $profileBox.DropDownStyle='DropDownList'
+$form.Controls.Add($profileBox)
+$idBox=TextBox 641 '' 170
+$nameBox=TextBox 678 '' 280
+Label 'ID（新增时填写）                          名称在下方填写' 636
+# Labels must not obscure the input fields.
+$idBox.BringToFront(); $nameBox.BringToFront()
+$newButton=New-Object Windows.Forms.Button; $newButton.Text='新增';$newButton.SetBounds(310,603,85,31)
+$saveButton=New-Object Windows.Forms.Button; $saveButton.Text='保存修改';$saveButton.SetBounds(405,603,120,31)
+$modelsButton=New-Object Windows.Forms.Button; $modelsButton.Text='获取模型';$modelsButton.SetBounds(535,603,135,31)
+$form.Controls.AddRange(@($newButton,$saveButton,$modelsButton))
+$migrateBox=New-Object Windows.Forms.CheckBox; $migrateBox.Text='同时迁移全部历史会话（可选）';$migrateBox.SetBounds(310,678,355,30)
+$form.Controls.Add($migrateBox)
+$script:LoadingProfiles=$false
+function Show-ProfileSelection {
+    if($script:LoadingProfiles){return}
+    $keyBox.Clear()
+    if($profileBox.SelectedIndex -eq 0){
+        $idBox.Text='openai';$idBox.ReadOnly=$true;$nameBox.Text='OpenAI 官方登录'
+        $baseBox.Text='';$modelBox.Text='';$catalogBox.Text=''
+        return
+    }
+    $p=@($script:ProfileStore.profiles)[$profileBox.SelectedIndex-1]
+    if(!$p){return}
+    $idBox.Text=$p.id; $idBox.ReadOnly=$true; $nameBox.Text=$p.name
+    $baseBox.Text=$p.baseUrl; $modelBox.Text=$p.models -join ', ';$catalogBox.Text=$p.catalog
+    if($p.catalog -and ![IO.File]::Exists($p.catalog)){
+        $cached=Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($configBox.Text))) ('codex-switcher\catalogs\'+$p.id+'.json')
+        if([IO.File]::Exists($cached)){$catalogBox.Text=$cached}
+    }
+    $status.Text='已加载：'+$p.name+'；密钥已加密保存，留空沿用。'
+}
+function Refresh-ProfileList([string]$Selected) {
+    $script:LoadingProfiles=$true
+    $profileBox.Items.Clear();$null=$profileBox.Items.Add('OpenAI 官方登录')
+    $index=0;$n=0
+    foreach($p in @($script:ProfileStore.profiles)){$n++;$null=$profileBox.Items.Add($p.name+' ['+$p.id+']');if($p.id -eq $Selected){$index=$n}}
+    $profileBox.SelectedIndex=$index
+    $script:LoadingProfiles=$false
+    Show-ProfileSelection
+}
 function Load-Settings {
     try {
-        $dir=Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($configBox.Text))) 'codex-switcher'
-        $script:DiagnosticLog = Join-Path $dir 'runtime.log'
-        Write-Diagnostic 'INFO' ('Loading settings; config=' + $configBox.Text)
-        $saved=Read-State $dir
-        if ($saved) { $baseBox.Text=$saved.apiBase; $modelBox.Text=$saved.model; $catalogBox.Text=$saved.catalog; $status.Text='上次切换：' + $saved.mode }
-        if (!$catalogBox.Text -or !(Test-Path -LiteralPath $catalogBox.Text -PathType Leaf)) {
-            $resolved = Resolve-DefaultCatalog $defaultHome ([IO.Path]::GetDirectoryName($script:SourceScript))
-            if ($resolved) { $catalogBox.Text = $resolved }
-        }
-    } catch { Write-Diagnostic 'ERROR' ($_.Exception.ToString() + "`n" + $_.ScriptStackTrace); $status.Text='配置加载失败，详见日志：' + $script:DiagnosticLog }
+        $script:ProfileStore=Get-ProfileStore $configBox.Text
+        $script:DiagnosticLog=Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($configBox.Text))) 'codex-switcher\runtime.log'
+        Refresh-ProfileList $script:ProfileStore.selected
+        Write-Diagnostic INFO 'Provider profiles loaded'
+    } catch { Write-Diagnostic ERROR ($_.Exception.ToString()+"`n"+$_.ScriptStackTrace);$status.Text='加载失败：'+$_.Exception.Message }
 }
-$configBox.Add_Leave({ Load-Settings })
-function Run-Switch([string]$Mode) {
+function Read-ProfileEditor {
+    $previous=@($script:ProfileStore.profiles | Where-Object {$_.id -eq $idBox.Text}) | Select-Object -First 1
+    return New-ProviderProfile $idBox.Text.Trim() $nameBox.Text $baseBox.Text.Trim() $modelBox.Text.Trim() $keyBox.Text.Trim() $catalogBox.Text.Trim() $previous
+}
+$profileBox.Add_SelectedIndexChanged({Show-ProfileSelection})
+$newButton.Add_Click({
+    $script:LoadingProfiles=$true;$profileBox.SelectedIndex=-1;$script:LoadingProfiles=$false
+    $idBox.ReadOnly=$false;$idBox.Text='';$nameBox.Text='';$baseBox.Text='';$modelBox.Text='';$keyBox.Clear();$catalogBox.Text=''
+    $status.Text='填写 ID、名称、接口、模型和密钥，然后保存或直接切换。'
+})
+$saveButton.Add_Click({
     try {
-        $officialButton.Enabled=$false; $deepseekButton.Enabled=$false; $monitorButton.Enabled=$false
-        $progress.Value=0
-        $status.Text='开始切换…'
-        $script:ProgressHandler = {
-            param($Percent,$Message)
-            try {
-                $script:progress.Value = [Math]::Max(0,[Math]::Min(100,[int]$Percent))
-                $script:status.Text = $Message
-                [Windows.Forms.Application]::DoEvents()
-            } catch { }
+        if($idBox.Text -eq 'openai'){throw '官方登录使用现有 ChatGPT 登录，无需保存 API Key。'}
+        $draft=($script:ProfileStore|ConvertTo-Json -Depth 30|ConvertFrom-Json)
+        $p=Read-ProfileEditor;Set-ProviderProfile $draft $p;Save-ProfileStore $configBox.Text $draft
+        $script:ProfileStore=$draft;$keyBox.Clear();Refresh-ProfileList $p.id;$status.Text='档案已保存；点击切换后才会应用到 Codex。'
+    } catch {Write-Diagnostic ERROR $_.Exception.Message;[Windows.Forms.MessageBox]::Show($_.Exception.Message,'保存失败')|Out-Null}
+})
+$modelsButton.Add_Click({
+    $ptr=[IntPtr]::Zero
+    try {
+        $uri=$null
+        if(![uri]::TryCreate($baseBox.Text.Trim(),[UriKind]::Absolute,[ref]$uri) -or $uri.Scheme -ne 'https' -or $uri.UserInfo -or $uri.Query -or $uri.Fragment){throw '请填写有效 HTTPS 基础地址。'}
+        $secret=$keyBox.Text.Trim()
+        if(!$secret){
+            $p=@($script:ProfileStore.profiles|Where-Object {$_.id -eq $idBox.Text})|Select-Object -First 1
+            if(!$p){throw '请填写 API Key。'}
+            $ptr=[Runtime.InteropServices.Marshal]::SecureStringToBSTR((ConvertTo-SecureString $p.credential))
+            $secret=[Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)
         }
-        $message=Switch-Mode $configBox.Text $Mode $baseBox.Text.Trim() $modelBox.Text.Trim() $keyBox.Text.Trim() $catalogBox.Text.Trim()
-        $script:ProgressHandler = $null
-        $progress.Value=100
-        $keyBox.Clear()
-        [Windows.Forms.MessageBox]::Show($message,'Codex 配置切换','OK','Information') | Out-Null
-        Load-Settings
-    } catch {
-        [Windows.Forms.MessageBox]::Show(($_.Exception.Message + "`r`n日志文件：" + $script:DiagnosticLog),'没有完成切换','OK','Error') | Out-Null
-    } finally {
-        $script:ProgressHandler=$null
-        $progress.Value=0
-        $officialButton.Enabled=$true; $deepseekButton.Enabled=$true; $monitorButton.Enabled=$true
-    }
+        $response=Invoke-RestMethod -Uri ($baseBox.Text.TrimEnd('/')+'/models') -Headers @{Authorization=('Bearer '+$secret)} -TimeoutSec 20
+        $models=@($response.data|ForEach-Object {$_.id}|Where-Object {$_})
+        if(!$models.Count){throw '接口未返回 data[].id；请手动填写模型列表。'}
+        $modelBox.Text=$models -join ', ';$status.Text='模型列表已读取，保存或切换后生效；这不代表已验证 Responses 推理。'
+    } catch {Write-Diagnostic ERROR 'Model list request failed (response body omitted to protect credentials)';[Windows.Forms.MessageBox]::Show('获取失败，请检查地址、密钥和 /models 支持情况，或手动填写模型。','获取模型失败')|Out-Null}
+    finally {if($ptr -ne [IntPtr]::Zero){[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)};$secret=$null}
+})
+$configBox.Add_Leave({Load-Settings})
+function Run-Switch([string]$Mode) {
+    $script:DiagnosticSecrets=@($keyBox.Text.Trim())
+    try {
+        foreach($c in @($officialButton,$deepseekButton,$newButton,$saveButton,$modelsButton,$profileBox)){$c.Enabled=$false}
+        $draft=($script:ProfileStore|ConvertTo-Json -Depth 30|ConvertFrom-Json)
+        $id='openai'
+        if($Mode -ne 'openai'){$p=Read-ProfileEditor;Set-ProviderProfile $draft $p;$id=$p.id}
+        $message=Switch-ProviderProfile $configBox.Text $draft $id -MigrateChats:$migrateBox.Checked -OfficialModel $modelBox.Text.Trim()
+        $keyBox.Clear();Load-Settings
+        [Windows.Forms.MessageBox]::Show($message,'切换完成')|Out-Null
+    } catch {Write-Diagnostic ERROR ($_.Exception.ToString()+"`n"+$_.ScriptStackTrace);[Windows.Forms.MessageBox]::Show(($_.Exception.Message+"`r`n日志："+$script:DiagnosticLog),'没有完成切换')|Out-Null}
+    finally {foreach($c in @($officialButton,$deepseekButton,$newButton,$saveButton,$modelsButton,$profileBox)){$c.Enabled=$true};$script:DiagnosticSecrets=@()}
 }
-$officialButton.Add_Click({ Run-Switch 'openai' })
-$deepseekButton.Add_Click({ Run-Switch 'deepseek' })
+$officialButton.Add_Click({Run-Switch 'openai'})
+$deepseekButton.Add_Click({Run-Switch 'profile'})
 Load-Settings
 
 $script:MonitorForm=$null; $script:MonitorBox=$null; $script:MonitorTimer=$null
@@ -1565,8 +1628,14 @@ if ($UiSmoke) {
     )
     [IO.File]::WriteAllText((Join-Path $smokeSessions 'rollout-01a1smoke.jsonl'), (($smokeLines -join "`r`n") + "`r`n"), $script:Utf8)
     $configBox.Text = $smokeConfig
-    if ($form.Controls.Count -lt 18 -or !$catalogBox.Text) { throw 'UI validation failed' }
+    if ($form.Controls.Count -lt 25 -or !$profileBox -or !$saveButton) { throw 'UI validation failed' }
     if (!$progress) { throw 'progress bar missing from the switch form' }
+    $script:ProfileStore=Get-ProfileStore $smokeConfig
+    $smokeProfile=New-ProviderProfile smoke 'Smoke Vendor' https://example.invalid/v1 'model-one,model-two' 'dummy-smoke-key' '' $null
+    Set-ProviderProfile $script:ProfileStore $smokeProfile
+    Save-ProfileStore $smokeConfig $script:ProfileStore
+    Refresh-ProfileList smoke
+    if($baseBox.Text -ne 'https://example.invalid/v1' -or $modelBox.Text -notmatch 'model-two' -or $keyBox.Text){throw 'Profile selection did not populate editor safely'}
     Show-Monitor
     if (!$script:MonitorForm -or !$script:MonitorBox) { throw 'monitor window failed to open' }
     $monitorText = $script:MonitorBox.Text

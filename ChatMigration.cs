@@ -797,7 +797,7 @@ public static class CodexSwitcherRollout
             SetExistingString(threadSettings, "model", model, stats);
             SetExistingString(threadSettings, "model_provider_id", provider, stats);
             SetExistingString(threadSettings, "reasoning_effort", effort, stats);
-            if (string.Equals(provider, "deepseek", StringComparison.OrdinalIgnoreCase)) SetExistingNull(threadSettings, "service_tier", stats);
+            if (!string.Equals(provider, "openai", StringComparison.OrdinalIgnoreCase)) SetExistingNull(threadSettings, "service_tier", stats);
             Node settings = Child(Child(threadSettings, "collaboration_mode"), "settings");
             SetExistingString(settings, "model", model, stats);
             SetExistingString(settings, "reasoning_effort", effort, stats);

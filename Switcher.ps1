@@ -1435,6 +1435,95 @@ $modelsButton=New-Object Windows.Forms.Button; $modelsButton.Text='获取模型'
 $form.Controls.AddRange(@($newButton,$saveButton,$modelsButton))
 $migrateBox=New-Object Windows.Forms.CheckBox; $migrateBox.Text='同时迁移全部历史会话（可选）';$migrateBox.SetBounds(310,678,355,30)
 $form.Controls.Add($migrateBox)
+# Arrange the existing controls using content-sized rows instead of pixel offsets.
+# A scrolling host keeps all actions reachable on short screens and at high DPI.
+$form.SuspendLayout()
+$form.Controls.Clear()
+$form.FormBorderStyle='Sizable'
+$form.MaximizeBox=$true
+$form.MinimumSize=New-Object Drawing.Size(600,460)
+$form.ClientSize=New-Object Drawing.Size(780,800)
+$form.AutoScaleMode=[Windows.Forms.AutoScaleMode]::Font
+$workArea=[Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+$form.Size=New-Object Drawing.Size([Math]::Min($form.Width,$workArea.Width),[Math]::Min($form.Height,$workArea.Height))
+$layoutHost=New-Object Windows.Forms.Panel
+$layoutHost.Dock='Fill';$layoutHost.AutoScroll=$true
+$form.Controls.Add($layoutHost)
+$mainLayout=New-Object Windows.Forms.TableLayoutPanel
+$mainLayout.Dock='Top';$mainLayout.AutoSize=$true;$mainLayout.AutoSizeMode='GrowAndShrink'
+$mainLayout.ColumnCount=1;$mainLayout.RowCount=0
+$mainLayout.Padding=New-Object Windows.Forms.Padding(18)
+$null=$mainLayout.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle([Windows.Forms.SizeType]::Percent,100)))
+$layoutHost.Controls.Add($mainLayout)
+$script:LayoutLabels=New-Object 'Collections.Generic.List[Windows.Forms.Label]'
+function Add-LayoutRow($Control) {
+    $row=$mainLayout.RowCount;$mainLayout.RowCount++
+    $null=$mainLayout.RowStyles.Add((New-Object Windows.Forms.RowStyle([Windows.Forms.SizeType]::AutoSize)))
+    $Control.Margin=New-Object Windows.Forms.Padding(0,0,0,8)
+    $Control.Dock='Fill'
+    $mainLayout.Controls.Add($Control,0,$row)
+}
+function Add-LayoutLabel([string]$Text) {
+    $label=New-Object Windows.Forms.Label
+    $label.Text=$Text;$label.AutoSize=$true
+    $script:LayoutLabels.Add($label)
+    Add-LayoutRow $label
+}
+function New-LayoutPair($InputControl,$ActionControl) {
+    $panel=New-Object Windows.Forms.TableLayoutPanel
+    $panel.AutoSize=$true;$panel.AutoSizeMode='GrowAndShrink';$panel.ColumnCount=2;$panel.RowCount=1
+    $null=$panel.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle([Windows.Forms.SizeType]::Percent,100)))
+    $null=$panel.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle([Windows.Forms.SizeType]::AutoSize)))
+    $InputControl.Dock='Fill';$InputControl.Margin=New-Object Windows.Forms.Padding(0,3,10,3)
+    $ActionControl.AutoSize=$true;$ActionControl.AutoSizeMode='GrowAndShrink'
+    $ActionControl.Padding=New-Object Windows.Forms.Padding(10,4,10,4)
+    $ActionControl.Margin=New-Object Windows.Forms.Padding(0)
+    $panel.Controls.Add($InputControl,0,0);$panel.Controls.Add($ActionControl,1,0)
+    return $panel
+}
+Add-LayoutLabel '配置文件（切换前请先正常退出 Codex）'
+Add-LayoutRow (New-LayoutPair $configBox $browseConfig)
+Add-LayoutLabel '已保存的供应商（选择后可修改配置）'
+$profileActions=New-Object Windows.Forms.FlowLayoutPanel
+$profileActions.AutoSize=$true;$profileActions.AutoSizeMode='GrowAndShrink';$profileActions.WrapContents=$false
+foreach($button in @($newButton,$saveButton)){
+    $button.AutoSize=$true;$button.AutoSizeMode='GrowAndShrink';$button.Padding=New-Object Windows.Forms.Padding(10,4,10,4)
+    $button.Margin=New-Object Windows.Forms.Padding(0,0,8,0);$profileActions.Controls.Add($button)
+}
+Add-LayoutRow (New-LayoutPair $profileBox $profileActions)
+Add-LayoutLabel '供应商 ID（新增时填写，保存后固定）'
+Add-LayoutRow $idBox
+Add-LayoutLabel '供应商名称'
+Add-LayoutRow $nameBox
+Add-LayoutLabel '接口基础地址 base_url（须支持 Responses API）'
+Add-LayoutRow $baseBox
+Add-LayoutLabel '模型列表（逗号分隔，第一个为默认模型；切官方时可填目标官方模型）'
+Add-LayoutRow (New-LayoutPair $modelBox $modelsButton)
+Add-LayoutLabel 'API Key（首次填写；后续留空沿用已保存密钥）'
+Add-LayoutRow $keyBox
+Add-LayoutLabel '模型能力目录 JSON（可选；MiMo 等供应商需选官方提供的目录）'
+Add-LayoutRow (New-LayoutPair $catalogBox $browseCatalog)
+$migrateBox.AutoSize=$true
+Add-LayoutRow $migrateBox
+$notice.AutoSize=$true;$script:LayoutLabels.Add($notice)
+Add-LayoutRow $notice
+Add-LayoutRow $progress
+$switchActions=New-Object Windows.Forms.FlowLayoutPanel
+$switchActions.AutoSize=$true;$switchActions.AutoSizeMode='GrowAndShrink';$switchActions.WrapContents=$true
+foreach($button in @($officialButton,$deepseekButton)){
+    $button.AutoSize=$true;$button.AutoSizeMode='GrowAndShrink';$button.Padding=New-Object Windows.Forms.Padding(14,8,14,8)
+    $button.Margin=New-Object Windows.Forms.Padding(0,0,12,6);$switchActions.Controls.Add($button)
+}
+Add-LayoutRow $switchActions
+$monitorButton.AutoSize=$true;$monitorButton.AutoSizeMode='GrowAndShrink';$monitorButton.Padding=New-Object Windows.Forms.Padding(10,6,10,6)
+Add-LayoutRow $monitorButton
+$status.AutoSize=$true;$script:LayoutLabels.Add($status)
+Add-LayoutRow $status
+$layoutHost.Add_SizeChanged({
+    $width=[Math]::Max(240,$layoutHost.ClientSize.Width-$mainLayout.Padding.Horizontal-[Windows.Forms.SystemInformation]::VerticalScrollBarWidth)
+    foreach($label in $script:LayoutLabels){$label.MaximumSize=New-Object Drawing.Size($width,0)}
+})
+$form.ResumeLayout($true)
 $script:LoadingProfiles=$false
 function Show-ProfileSelection {
     if($script:LoadingProfiles){return}
@@ -1628,7 +1717,7 @@ if ($UiSmoke) {
     )
     [IO.File]::WriteAllText((Join-Path $smokeSessions 'rollout-01a1smoke.jsonl'), (($smokeLines -join "`r`n") + "`r`n"), $script:Utf8)
     $configBox.Text = $smokeConfig
-    if ($form.Controls.Count -lt 25 -or !$profileBox -or !$saveButton) { throw 'UI validation failed' }
+    if ($mainLayout.Controls.Count -lt 20 -or !$profileBox -or !$saveButton) { throw 'UI validation failed' }
     if (!$progress) { throw 'progress bar missing from the switch form' }
     $script:ProfileStore=Get-ProfileStore $smokeConfig
     $smokeProfile=New-ProviderProfile smoke 'Smoke Vendor' https://example.invalid/v1 'model-one,model-two' 'dummy-smoke-key' '' $null
@@ -1655,7 +1744,34 @@ if ($UiSmoke) {
     $monitorChars = $monitorText.Length
     $script:MonitorTimer.Stop()
     $script:MonitorForm.Dispose()
-    Write-Output ('UI smoke PASS; controls=' + $form.Controls.Count + '; monitorChars=' + $monitorChars)
+    # Exercise wrapping and scrolling with narrow windows and larger system-style fonts.
+    foreach($fontSize in @(10,15)) {
+        $form.Font=New-Object Drawing.Font('Microsoft YaHei UI',$fontSize)
+        foreach($windowWidth in @(600,900)) {
+            $form.ClientSize=New-Object Drawing.Size($windowWidth,650)
+            $form.Show();$form.PerformLayout();[Windows.Forms.Application]::DoEvents()
+            foreach($label in $script:LayoutLabels) {
+                if($label.Height -lt $label.GetPreferredSize((New-Object Drawing.Size($label.Width,0))).Height){throw ('Clipped label: '+$label.Text)}
+            }
+            foreach($button in @($newButton,$saveButton)) {
+                if($button.Right -gt $profileActions.ClientSize.Width -or $button.Bottom -gt $profileActions.ClientSize.Height){throw ('Clipped profile action: '+$button.Text)}
+            }
+            $children=@($mainLayout.Controls)
+            for($i=0;$i -lt $children.Count;$i++) {
+                for($j=$i+1;$j -lt $children.Count;$j++) {
+                    if($children[$i].Bounds.IntersectsWith($children[$j].Bounds)){throw 'Layout rows overlap'}
+                }
+            }
+            if($mainLayout.Height -gt $layoutHost.ClientSize.Height -and !$layoutHost.VerticalScroll.Visible){throw 'Overflowing layout has no scrollbar'}
+        }
+    }
+    $form.Font=New-Object Drawing.Font('Microsoft YaHei UI',10)
+    $form.ClientSize=New-Object Drawing.Size(780,900)
+    $form.PerformLayout();[Windows.Forms.Application]::DoEvents()
+    $preview=Join-Path ([IO.Path]::GetTempPath()) 'codex-switcher-layout-preview.png'
+    $bitmap=New-Object Drawing.Bitmap($form.Width,$form.Height)
+    try{$form.DrawToBitmap($bitmap,(New-Object Drawing.Rectangle(0,0,$form.Width,$form.Height)));$bitmap.Save($preview)}finally{$bitmap.Dispose()}
+    Write-Output ('UI smoke PASS; layoutRows=' + $mainLayout.Controls.Count + '; fontSizes=10,15; widths=600,900; monitorChars=' + $monitorChars)
     $form.Dispose()
     # 自测用的临时目录不要留在 %TEMP% 里
     try { Remove-Item -LiteralPath $smokeRoot -Recurse -Force } catch { }

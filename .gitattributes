@@ -1,0 +1,8 @@
+# 统一行尾：仓库内为 LF；Windows 脚本按平台习惯检出为 CRLF（.ps1 另需 UTF-8 BOM）
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.png binary
+*.jpg binary
+*.zip binary

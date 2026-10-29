@@ -1,0 +1,248 @@
+{
+    "models":  [
+                   {
+                       "slug":  "deepseek-v4-flash",
+                       "display_name":  "DeepSeek Flash (deepseek-v4-flash)",
+                       "description":  "DeepSeek Flash Responses API (legacy alias).",
+                       "priority":  1,
+                       "visibility":  "list",
+                       "supported_in_api":  true,
+                       "minimal_client_version":  "0.144.0",
+                       "prefer_websockets":  false,
+                       "support_verbosity":  true,
+                       "default_verbosity":  "low",
+                       "apply_patch_tool_type":  "freeform",
+                       "web_search_tool_type":  "text",
+                       "input_modalities":  [
+                                                "text",
+                                                "image"
+                                            ],
+                       "supports_image_detail_original":  true,
+                       "truncation_policy":  {
+                                                 "mode":  "tokens",
+                                                 "limit":  10000
+                                             },
+                       "supports_parallel_tool_calls":  true,
+                       "shell_type":  "shell_command",
+                       "tool_mode":  null,
+                       "multi_agent_version":  "v2",
+                       "use_responses_lite":  false,
+                       "include_skills_usage_instructions":  false,
+                       "context_window":  1048576,
+                       "max_context_window":  1048576,
+                       "effective_context_window_percent":  95,
+                       "auto_compact_token_limit":  null,
+                       "comp_hash":  "3000",
+                       "reasoning_summary_format":  "experimental",
+                       "default_reasoning_summary":  "none",
+                       "default_reasoning_level":  "high",
+                       "supported_reasoning_levels":  [
+                                                          {
+                                                              "effort":  "low",
+                                                              "description":  "Low"
+                                                          },
+                                                          {
+                                                              "effort":  "high",
+                                                              "description":  "High"
+                                                          },
+                                                          {
+                                                              "effort":  "max",
+                                                              "description":  "Max"
+                                                          }
+                                                      ],
+                       "supports_reasoning_summaries":  true,
+                       "base_instructions":  "You are a coding assistant. Inspect the workspace, follow the user\u0027s instructions, preserve unrelated changes, use available tools, and verify your work. Report results and limitations honestly.",
+                       "model_messages":  null,
+                       "experimental_supported_tools":  [
+
+                                                        ],
+                       "supports_search_tool":  false,
+                       "default_service_tier":  null,
+                       "availability_nux":  null,
+                       "upgrade":  null
+                   },
+                   {
+                       "slug":  "deepseek-v4-pro",
+                       "display_name":  "deepseek-v4-pro",
+                       "description":  "由 Codex 切换工具按你填写的模型名添加；能力元数据继承自目录中的模板条目。",
+                       "priority":  2,
+                       "visibility":  "list",
+                       "supported_in_api":  true,
+                       "minimal_client_version":  "0.144.0",
+                       "prefer_websockets":  false,
+                       "support_verbosity":  true,
+                       "default_verbosity":  "low",
+                       "apply_patch_tool_type":  "freeform",
+                       "web_search_tool_type":  "text",
+                       "input_modalities":  [
+                                                "text",
+                                                "image"
+                                            ],
+                       "supports_image_detail_original":  true,
+                       "truncation_policy":  {
+                                                 "mode":  "tokens",
+                                                 "limit":  10000
+                                             },
+                       "supports_parallel_tool_calls":  true,
+                       "shell_type":  "shell_command",
+                       "tool_mode":  null,
+                       "multi_agent_version":  "v2",
+                       "use_responses_lite":  false,
+                       "include_skills_usage_instructions":  false,
+                       "context_window":  1048576,
+                       "max_context_window":  1048576,
+                       "effective_context_window_percent":  95,
+                       "auto_compact_token_limit":  null,
+                       "comp_hash":  "3000",
+                       "reasoning_summary_format":  "experimental",
+                       "default_reasoning_summary":  "none",
+                       "default_reasoning_level":  "high",
+                       "supported_reasoning_levels":  [
+                                                          {
+                                                              "effort":  "low",
+                                                              "description":  "Low"
+                                                          },
+                                                          {
+                                                              "effort":  "high",
+                                                              "description":  "High"
+                                                          },
+                                                          {
+                                                              "effort":  "max",
+                                                              "description":  "Max"
+                                                          }
+                                                      ],
+                       "supports_reasoning_summaries":  true,
+                       "base_instructions":  "You are a coding assistant. Inspect the workspace, follow the user\u0027s instructions, preserve unrelated changes, use available tools, and verify your work. Report results and limitations honestly.",
+                       "model_messages":  null,
+                       "experimental_supported_tools":  [
+
+                                                        ],
+                       "supports_search_tool":  false,
+                       "default_service_tier":  null,
+                       "availability_nux":  null,
+                       "upgrade":  null
+                   },
+                   {
+                       "slug":  "deepseek-v4-flash-vision-exp",
+                       "display_name":  "deepseek-v4-flash-vision-exp",
+                       "description":  "由 Codex 切换工具按你填写的模型名添加；能力元数据继承自目录中的模板条目。",
+                       "priority":  3,
+                       "visibility":  "list",
+                       "supported_in_api":  true,
+                       "minimal_client_version":  "0.144.0",
+                       "prefer_websockets":  false,
+                       "support_verbosity":  true,
+                       "default_verbosity":  "low",
+                       "apply_patch_tool_type":  "freeform",
+                       "web_search_tool_type":  "text",
+                       "input_modalities":  [
+                                                "text",
+                                                "image"
+                                            ],
+                       "supports_image_detail_original":  true,
+                       "truncation_policy":  {
+                                                 "mode":  "tokens",
+                                                 "limit":  10000
+                                             },
+                       "supports_parallel_tool_calls":  true,
+                       "shell_type":  "shell_command",
+                       "tool_mode":  null,
+                       "multi_agent_version":  "v2",
+                       "use_responses_lite":  false,
+                       "include_skills_usage_instructions":  false,
+                       "context_window":  1048576,
+                       "max_context_window":  1048576,
+                       "effective_context_window_percent":  95,
+                       "auto_compact_token_limit":  null,
+                       "comp_hash":  "3000",
+                       "reasoning_summary_format":  "experimental",
+                       "default_reasoning_summary":  "none",
+                       "default_reasoning_level":  "high",
+                       "supported_reasoning_levels":  [
+                                                          {
+                                                              "effort":  "low",
+                                                              "description":  "Low"
+                                                          },
+                                                          {
+                                                              "effort":  "high",
+                                                              "description":  "High"
+                                                          },
+                                                          {
+                                                              "effort":  "max",
+                                                              "description":  "Max"
+                                                          }
+                                                      ],
+                       "supports_reasoning_summaries":  true,
+                       "base_instructions":  "You are a coding assistant. Inspect the workspace, follow the user\u0027s instructions, preserve unrelated changes, use available tools, and verify your work. Report results and limitations honestly.",
+                       "model_messages":  null,
+                       "experimental_supported_tools":  [
+
+                                                        ],
+                       "supports_search_tool":  false,
+                       "default_service_tier":  null,
+                       "availability_nux":  null,
+                       "upgrade":  null
+                   },
+                   {
+                       "slug":  "deepseek-flash",
+                       "display_name":  "deepseek-flash",
+                       "description":  "由 Codex 切换工具按你填写的模型名添加；能力元数据继承自目录中的模板条目。",
+                       "priority":  4,
+                       "visibility":  "list",
+                       "supported_in_api":  true,
+                       "minimal_client_version":  "0.144.0",
+                       "prefer_websockets":  false,
+                       "support_verbosity":  true,
+                       "default_verbosity":  "low",
+                       "apply_patch_tool_type":  "freeform",
+                       "web_search_tool_type":  "text",
+                       "input_modalities":  [
+                                                "text",
+                                                "image"
+                                            ],
+                       "supports_image_detail_original":  true,
+                       "truncation_policy":  {
+                                                 "mode":  "tokens",
+                                                 "limit":  10000
+                                             },
+                       "supports_parallel_tool_calls":  true,
+                       "shell_type":  "shell_command",
+                       "tool_mode":  null,
+                       "multi_agent_version":  "v2",
+                       "use_responses_lite":  false,
+                       "include_skills_usage_instructions":  false,
+                       "context_window":  1048576,
+                       "max_context_window":  1048576,
+                       "effective_context_window_percent":  95,
+                       "auto_compact_token_limit":  null,
+                       "comp_hash":  "3000",
+                       "reasoning_summary_format":  "experimental",
+                       "default_reasoning_summary":  "none",
+                       "default_reasoning_level":  "high",
+                       "supported_reasoning_levels":  [
+                                                          {
+                                                              "effort":  "low",
+                                                              "description":  "Low"
+                                                          },
+                                                          {
+                                                              "effort":  "high",
+                                                              "description":  "High"
+                                                          },
+                                                          {
+                                                              "effort":  "max",
+                                                              "description":  "Max"
+                                                          }
+                                                      ],
+                       "supports_reasoning_summaries":  true,
+                       "base_instructions":  "You are a coding assistant. Inspect the workspace, follow the user\u0027s instructions, preserve unrelated changes, use available tools, and verify your work. Report results and limitations honestly.",
+                       "model_messages":  null,
+                       "experimental_supported_tools":  [
+
+                                                        ],
+                       "supports_search_tool":  false,
+                       "default_service_tier":  null,
+                       "availability_nux":  null,
+                       "upgrade":  null
+                   }
+               ]
+}

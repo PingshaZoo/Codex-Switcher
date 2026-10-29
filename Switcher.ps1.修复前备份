@@ -1,0 +1,1312 @@
+﻿param([switch]$EmitKey, [string]$KeyFile, [switch]$LibraryOnly, [switch]$UiSmoke)
+$ErrorActionPreference = 'Stop'
+if ($EmitKey) {
+    try {
+        $secure = ConvertTo-SecureString ([IO.File]::ReadAllText($KeyFile))
+        $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+        try { [Console]::Write([Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)) }
+        finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
+        exit 0
+    } catch { [Console]::Error.WriteLine('Unable to unlock DeepSeek credential. Re-enter the key in Switcher.'); exit 1 }
+}
+$script:SourceScript = $PSCommandPath
+$script:ManagedKeys = @('model','model_provider','model_catalog_json','model_context_window','model_auto_compact_token_limit','model_reasoning_effort','model_reasoning_summary','model_verbosity','model_supports_reasoning_summaries','disable_response_storage','forced_login_method','openai_base_url','review_model','service_tier')
+$script:Utf8 = New-Object Text.UTF8Encoding($false)
+
+function Quote-Toml([string]$Value) {
+    if ($Value -match '[\x00-\x1f]') { throw '配置值不能包含换行或控制字符。' }
+    return '"' + $Value.Replace('\','\\').Replace('"','\"') + '"'
+}
+function Split-Config([string]$Text) {
+    # Deliberately refuses multiline strings rather than risking unrelated TOML content.
+    if ($Text.Contains('"""') -or $Text.Contains("'''")) { throw '此配置含 TOML 多行字符串，工具无法安全局部编辑，未做修改。' }
+    $lines = [regex]::Split($Text, '\r?\n')
+    $roots = New-Object 'Collections.Generic.List[string]'
+    $keep = New-Object 'Collections.Generic.List[string]'
+    $atRoot = $true
+    foreach ($line in $lines) {
+        if ($line -match '^\s*\[') { $atRoot = $false }
+        if ($atRoot -and $line -match '^\s*([A-Za-z_][\w-]*)\s*=') {
+            if ($script:ManagedKeys -contains $Matches[1]) { $roots.Add($line); continue }
+        }
+        $keep.Add($line)
+    }
+    return @{ Root = @($roots.ToArray()); Rest = ($keep.ToArray() -join "`r`n") }
+}
+function Root-Value($Lines, [string]$Name) {
+    foreach ($line in $Lines) {
+        if ($line -match ('^\s*' + [regex]::Escape($Name) + '\s*=\s*["'']([^"'']*)["'']')) { return $Matches[1] }
+    }
+    return $null
+}
+function Make-Config([string]$Original, [string[]]$Root, [string]$Extra = '') {
+    $split = Split-Config $Original
+    return (($Root -join "`r`n") + "`r`n" + $split.Rest.TrimEnd() + "`r`n" + $Extra)
+}
+function Atomic-Write([string]$Path, [string]$Text) {
+    $tmp = $Path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+    try {
+        [IO.File]::WriteAllText($tmp, $Text, $script:Utf8)
+        if ([IO.File]::Exists($Path)) { [IO.File]::Replace($tmp, $Path, [System.Management.Automation.Language.NullString]::Value) }
+        else { [IO.File]::Move($tmp, $Path) }
+    } finally { if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) } }
+}
+function Read-State([string]$Dir) {
+    $p = Join-Path $Dir 'state.json'
+    if (Test-Path -LiteralPath $p) { return ([IO.File]::ReadAllText($p) | ConvertFrom-Json) }
+    return $null
+}
+function Split-ModelList([string]$Value) {
+    # 模型名可以自由填写；多个用逗号、分号或空白分隔，第一个为当前生效模型。
+    $items = New-Object 'Collections.Generic.List[string]'
+    foreach ($piece in [regex]::Split([string]$Value,'[,;\s]+')) {
+        $name = $piece.Trim()
+        if ($name -and !$items.Contains($name)) { $items.Add($name) }
+    }
+    return @($items.ToArray())
+}
+function Read-CatalogObject([string]$Path) {
+    if (!(Test-Path -LiteralPath $Path -PathType Leaf)) { throw ('找不到模型目录文件：' + $Path) }
+    $object = $null
+    $text = [IO.File]::ReadAllText($Path)
+    if ($text.Length -gt 0 -and [int]$text[0] -eq 0xFEFF) { $text = $text.Substring(1) }
+    try { $object = ($text | ConvertFrom-Json) }
+    catch { throw ('模型目录不是有效 JSON：' + $Path + '；' + $_.Exception.Message) }
+    if (!$object -or !$object.PSObject.Properties['models'] -or @($object.models).Count -eq 0) {
+        throw ('模型目录没有 models 数组或内容为空：' + $Path)
+    }
+    return $object
+}
+function Get-CatalogSlugs($CatalogObject) {
+    $list = New-Object 'Collections.Generic.List[string]'
+    foreach ($entry in @($CatalogObject.models)) { if ($entry.slug) { $list.Add([string]$entry.slug) } }
+    return @($list.ToArray())
+}
+function Set-ObjectProperty($Object,[string]$Name,$Value) {
+    if ($Object.PSObject.Properties[$Name]) { $Object.PSObject.Properties[$Name].Value = $Value }
+    else { $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value }
+}
+function New-CatalogEntry($Template,[string]$Slug,[int]$Priority) {
+    $entry = if ($Template) { ($Template | ConvertTo-Json -Depth 25 | ConvertFrom-Json) } else { New-Object psobject }
+    Set-ObjectProperty $entry 'slug' $Slug
+    Set-ObjectProperty $entry 'display_name' $Slug
+    Set-ObjectProperty $entry 'description' '由 Codex 切换工具按你填写的模型名添加；能力元数据继承自目录中的模板条目。'
+    Set-ObjectProperty $entry 'priority' $Priority
+    return $entry
+}
+function Test-CatalogEntryComplete($Entry) {
+    # Codex 会校验能力元数据；缺少 base_instructions 的条目会让它启动失败。
+    return [bool]($Entry -and $Entry.PSObject.Properties['base_instructions'])
+}
+function Get-CompleteCatalogEntry($CatalogObject) {
+    foreach ($entry in @($CatalogObject.models)) { if (Test-CatalogEntryComplete $entry) { return $entry } }
+    return $null
+}
+function Get-CatalogDerivationTemplate($CatalogObject) {
+    # 优先用目录里已有的完整条目；目录条目不完整时退回工具自带的完整条目。
+    $complete = Get-CompleteCatalogEntry $CatalogObject
+    if ($complete) { return $complete }
+    $bundled = Join-Path ([IO.Path]::GetDirectoryName($script:SourceScript)) 'deepseek-models.json'
+    if (Test-Path -LiteralPath $bundled -PathType Leaf) {
+        try { $complete = Get-CompleteCatalogEntry (Read-CatalogObject $bundled) } catch { $complete = $null }
+        if ($complete) { return $complete }
+    }
+    return @($CatalogObject.models)[0]
+}
+function Add-CatalogModels($CatalogObject,[string[]]$Models) {
+    # 只追加目录里没有的模型；已存在的不动，避免重复条目。
+    $existing = @(Get-CatalogSlugs $CatalogObject)
+    $template = Get-CatalogDerivationTemplate $CatalogObject
+    $priority = 0
+    foreach ($entry in @($CatalogObject.models)) {
+        $value = 0
+        if ($entry.PSObject.Properties['priority'] -and [int]::TryParse([string]$entry.priority,[ref]$value)) {
+            if ($value -gt $priority) { $priority = $value }
+        }
+    }
+    $added = New-Object 'Collections.Generic.List[string]'
+    foreach ($slug in @($Models)) {
+        if ($existing -contains $slug) { continue }
+        $priority++
+        $CatalogObject.models = @($CatalogObject.models) + (New-CatalogEntry $template $slug $priority)
+        $added.Add($slug)
+        $existing += $slug
+    }
+    return @($added.ToArray())
+}
+function Backup-CatalogFile([string]$Path,[string]$Dir) {
+    try {
+        $target = Join-Path (Join-Path $Dir 'catalog-backups') ((Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' + [IO.Path]::GetFileName($Path))
+        $null = New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($target)) -Force
+        Copy-Item -LiteralPath $Path -Destination $target -Force
+        return $target
+    } catch { return $null }
+}
+function Convert-ToLfText([string]$Text) {
+    # 仓库与 JSON 统一 LF，避免行尾在版本管理里反复变动。
+    return ([string]$Text -replace "`r`n","`n")
+}
+function Resolve-DefaultCatalog([string]$DefaultHome,[string]$ScriptRoot) {
+    # 优先沿用上次使用过的目录，其次本机既有 models.json，最后用工具自带目录。
+    foreach ($candidate in @((Join-Path $DefaultHome 'models.json'),(Join-Path $ScriptRoot 'deepseek-models.json'))) {
+        if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) { return $candidate }
+    }
+    return ''
+}
+function Assert-Closed {
+    $active = @(Get-Process -Name 'Codex','ChatGPT' -ErrorAction SilentlyContinue)
+    if ($active.Count -gt 0) { throw '请先正常退出 Codex / ChatGPT 桌面应用及 Codex 命令行，再点击切换。工具不会强制结束正在运行的任务。' }
+}
+function Write-Log([string]$Dir,[string]$Message) {
+    [IO.File]::AppendAllText((Join-Path $Dir 'switch.log'), ('{0} {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'),$Message) + "`r`n", $script:Utf8)
+}
+$script:ProgressHandler = $null
+$script:TimingRows = $null
+function Report-Progress([int]$Percent,[string]$Message) {
+    if ($script:ProgressHandler) {
+        try { & $script:ProgressHandler $Percent $Message } catch { }
+    }
+}
+function Add-SwitchTiming([string]$Phase,[double]$Ms,[string]$Note = '') {
+    if ($null -eq $script:TimingRows) { $script:TimingRows = New-Object 'Collections.Generic.List[object]' }
+    $script:TimingRows.Add([pscustomobject]@{ Phase=$Phase; Ms=[Math]::Round($Ms,1); Note=$Note })
+}
+function Format-SwitchTiming {
+    if (!$script:TimingRows -or $script:TimingRows.Count -eq 0) { return '' }
+    $lines = New-Object 'Collections.Generic.List[string]'
+    foreach ($row in $script:TimingRows) {
+        $line = '  ' + (([double]$row.Ms).ToString('N1')).PadLeft(9) + ' ms  ' + $row.Phase
+        if ($row.Note) { $line += '  ' + $row.Note }
+        $lines.Add($line)
+    }
+    return ($lines.ToArray() -join "`r`n")
+}
+function Get-SwitchTimingTotalMs {
+    if (!$script:TimingRows) { return 0 }
+    $total = 0.0
+    foreach ($row in $script:TimingRows) { $total += [double]$row.Ms }
+    return $total
+}
+function Initialize-SqliteInterop {
+    if ('CodexSwitcherSqlite' -as [type]) { return }
+    $source = Join-Path ([IO.Path]::GetDirectoryName($script:SourceScript)) 'ChatMigration.cs'
+    if (!(Test-Path -LiteralPath $source -PathType Leaf)) { throw "缺少会话迁移组件：$source" }
+    Add-Type -Path $source
+}
+function Find-CodexStateDatabase([string]$CodexRoot) {
+    Initialize-SqliteInterop
+    $candidates = @(
+        Get-ChildItem -LiteralPath $CodexRoot -Filter 'state_*.sqlite' -File -ErrorAction SilentlyContinue
+        Get-ChildItem -LiteralPath (Join-Path $CodexRoot 'sqlite') -Filter 'state_*.sqlite' -File -ErrorAction SilentlyContinue
+    ) | Sort-Object LastWriteTime -Descending
+    foreach ($candidate in $candidates) {
+        if ([CodexSwitcherSqlite]::HasThreadsTable($candidate.FullName)) { return $candidate.FullName }
+    }
+    return $null
+}
+function Find-CodexProjectionDatabase([string]$CodexRoot) {
+    Initialize-SqliteInterop
+    $candidates = @(
+        Get-ChildItem -LiteralPath $CodexRoot -Filter 'thread_history_*.sqlite' -File -ErrorAction SilentlyContinue
+        Get-ChildItem -LiteralPath (Join-Path $CodexRoot 'sqlite') -Filter 'thread_history_*.sqlite' -File -ErrorAction SilentlyContinue
+    ) | Sort-Object LastWriteTime -Descending
+    foreach ($candidate in $candidates) {
+        if ([CodexSwitcherSqlite]::HasProjectionTables($candidate.FullName)) { return $candidate.FullName }
+    }
+    return $null
+}
+function Get-RolloutFiles([string]$CodexRoot) {
+    $result = New-Object 'Collections.Generic.List[IO.FileInfo]'
+    foreach ($name in @('sessions','archived_sessions')) {
+        $root = Join-Path $CodexRoot $name
+        if (Test-Path -LiteralPath $root -PathType Container) {
+            foreach ($file in Get-ChildItem -LiteralPath $root -Filter 'rollout-*.jsonl' -File -Recurse -ErrorAction Stop) {
+                $result.Add($file)
+            }
+        }
+    }
+    return @($result.ToArray())
+}
+function Set-ExistingJsonValue($Object,[string]$Name,$Value,$Stats,[string]$Counter='RouteChanges') {
+    if ($null -eq $Object) { return }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($property -and $property.Value -ne $Value) {
+        $property.Value = $Value
+        $Stats[$Counter]++
+    }
+}
+function Remove-JsonProperty($Object,[string]$Name,$Stats) {
+    if ($null -eq $Object) { return }
+    if ($Object.PSObject.Properties[$Name]) {
+        $Object.PSObject.Properties.Remove($Name)
+        $Stats.CompatibilityChanges++
+    }
+}
+function Convert-ToolIdentifier([string]$Value,$Stats,$Map) {
+    if (!$Value -or !$Value.StartsWith('tool_',[StringComparison]::Ordinal)) { return $Value }
+    if (!$Map.ContainsKey($Value)) { $Map[$Value] = 'fc_' + $Value.Substring(5) }
+    $Stats.CompatibilityChanges++
+    return $Map[$Value]
+}
+function Convert-CompatibleHistoryNode($Node,[string]$Provider,$Stats,$ToolIds) {
+    if ($null -eq $Node -or $Node -is [string] -or $Node.GetType().IsPrimitive) { return }
+    if ($Node -is [Collections.IEnumerable] -and !($Node -is [Management.Automation.PSCustomObject]) -and !($Node -is [Collections.IDictionary])) {
+        foreach ($item in $Node) { Convert-CompatibleHistoryNode $item $Provider $Stats $ToolIds }
+        return
+    }
+    $typeProperty = $Node.PSObject.Properties['type']
+    $itemType = if ($typeProperty) { [string]$typeProperty.Value } else { '' }
+    if ($itemType -eq 'reasoning') {
+        Remove-JsonProperty $Node 'encrypted_content' $Stats
+        Remove-JsonProperty $Node 'id' $Stats
+        if ($Provider -eq 'openai' -and $Node.PSObject.Properties['content'] -and @($Node.content).Count -gt 0) {
+            $Node.content = @()
+            $Stats.CompatibilityChanges++
+        }
+    }
+    if ($itemType -in @('function_call','function_call_output','custom_tool_call','custom_tool_call_output','tool_search_call','tool_search_output')) {
+        foreach ($name in @('call_id','id')) {
+            $property = $Node.PSObject.Properties[$name]
+            if ($property -and $property.Value -is [string] -and $property.Value.StartsWith('tool_',[StringComparison]::Ordinal)) {
+                $property.Value = Convert-ToolIdentifier ([string]$property.Value) $Stats $ToolIds
+            }
+        }
+    }
+    foreach ($property in @($Node.PSObject.Properties)) {
+        Convert-CompatibleHistoryNode $property.Value $Provider $Stats $ToolIds
+    }
+}
+function Set-RolloutRuntimeFields($Record,[string]$Provider,[string]$Model,[string]$Effort,$Stats) {
+    $payload = $Record.payload
+    if (!$payload) { return }
+    switch ([string]$Record.type) {
+        'session_meta' {
+            Set-ExistingJsonValue $payload 'model_provider' $Provider $Stats
+        }
+        'turn_context' {
+            Set-ExistingJsonValue $payload 'model' $Model $Stats
+            Set-ExistingJsonValue $payload 'effort' $Effort $Stats
+            if ($payload.collaboration_mode -and $payload.collaboration_mode.settings) {
+                Set-ExistingJsonValue $payload.collaboration_mode.settings 'model' $Model $Stats
+                Set-ExistingJsonValue $payload.collaboration_mode.settings 'reasoning_effort' $Effort $Stats
+            }
+        }
+        'event_msg' {
+            if ($payload.type -eq 'thread_settings_applied' -and $payload.thread_settings) {
+                Set-ExistingJsonValue $payload.thread_settings 'model' $Model $Stats
+                Set-ExistingJsonValue $payload.thread_settings 'model_provider_id' $Provider $Stats
+                Set-ExistingJsonValue $payload.thread_settings 'reasoning_effort' $Effort $Stats
+                if ($Provider -eq 'deepseek') { Set-ExistingJsonValue $payload.thread_settings 'service_tier' $null $Stats }
+                if ($payload.thread_settings.collaboration_mode -and $payload.thread_settings.collaboration_mode.settings) {
+                    Set-ExistingJsonValue $payload.thread_settings.collaboration_mode.settings 'model' $Model $Stats
+                    Set-ExistingJsonValue $payload.thread_settings.collaboration_mode.settings 'reasoning_effort' $Effort $Stats
+                }
+            }
+        }
+        'world_state' {
+            if ($payload.state) {
+                Set-ExistingJsonValue $payload.state 'model' $Model $Stats
+                if ($payload.state.collaboration_mode) { Set-ExistingJsonValue $payload.state.collaboration_mode 'model' $Model $Stats }
+                if ($payload.state.personality) { Set-ExistingJsonValue $payload.state.personality 'model' $Model $Stats }
+            }
+        }
+        'compacted' {
+            if ($payload.resume_metadata -and $payload.resume_metadata.previous_turn_settings) {
+                Set-ExistingJsonValue $payload.resume_metadata.previous_turn_settings 'model' $Model $Stats
+                Set-ExistingJsonValue $payload.resume_metadata.previous_turn_settings 'model_provider_id' $Provider $Stats
+                Set-ExistingJsonValue $payload.resume_metadata.previous_turn_settings 'reasoning_effort' $Effort $Stats
+            }
+        }
+    }
+}
+function Get-TextFileLayout([string]$Path) {
+    $stream = [IO.File]::OpenRead($Path)
+    try {
+        $buffer = New-Object byte[] 65536
+        $read = $stream.Read($buffer,0,$buffer.Length)
+        $newline = "`n"
+        for ($i=0; $i -lt $read; $i++) {
+            if ($buffer[$i] -eq 10) { if ($i -gt 0 -and $buffer[$i-1] -eq 13) { $newline="`r`n" }; break }
+        }
+        $trailing = $false
+        if ($stream.Length -gt 0) { $stream.Seek(-1,[IO.SeekOrigin]::End) | Out-Null; $trailing = ($stream.ReadByte() -eq 10) }
+        return @{ Newline=$newline; Trailing=$trailing }
+    } finally { $stream.Dispose() }
+}
+# 参考实现：仅供回归测试做等价性比对，生产路径是 ChatMigration.cs 里的 C# 引擎
+# （语义相同，速度快两个数量级）。两者输出必须逐行等价，见 tests/Test-RolloutRewrite.ps1。
+function Update-RolloutForTargetReference([string]$Path,[string]$Provider,[string]$Model,[string]$Effort) {
+    $layout = Get-TextFileLayout $Path
+    $stats = @{ RouteChanges=0; CompatibilityChanges=0 }
+    $toolIds = @{}
+    $tmp = $Path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+    $created = [IO.File]::GetCreationTimeUtc($Path)
+    $written = [IO.File]::GetLastWriteTimeUtc($Path)
+    $reader = $null; $writer = $null
+    try {
+        $reader = New-Object IO.StreamReader($Path,$script:Utf8,$true,65536)
+        $writer = New-Object IO.StreamWriter($tmp,$false,$script:Utf8,65536)
+        $first = $true
+        $lineNumber = 0
+        while (($line = $reader.ReadLine()) -ne $null) {
+            $lineNumber++
+            try { $record = $line | ConvertFrom-Json }
+            catch { throw "会话文件第 $lineNumber 行不是有效 JSON：$Path" }
+            if ($lineNumber -eq 1 -and ($record.type -ne 'session_meta' -or !$record.payload -or !$record.payload.PSObject.Properties['model_provider'])) {
+                throw "会话文件缺少 session_meta.model_provider：$Path"
+            }
+            $before = $stats.RouteChanges + $stats.CompatibilityChanges
+            Set-RolloutRuntimeFields $record $Provider $Model $Effort $stats
+            Convert-CompatibleHistoryNode $record $Provider $stats $toolIds
+            if ($first) { $first=$false } else { $writer.Write($layout.Newline) }
+            if (($stats.RouteChanges + $stats.CompatibilityChanges) -ne $before) {
+                $writer.Write(($record | ConvertTo-Json -Compress -Depth 100))
+            } else { $writer.Write($line) }
+        }
+        if ($layout.Trailing -and !$first) { $writer.Write($layout.Newline) }
+        $reader.Dispose(); $reader=$null; $writer.Dispose(); $writer=$null
+        if (($stats.RouteChanges + $stats.CompatibilityChanges) -gt 0) {
+            [IO.File]::Replace($tmp,$Path,[Management.Automation.Language.NullString]::Value)
+            [IO.File]::SetCreationTimeUtc($Path,$created)
+            [IO.File]::SetLastWriteTimeUtc($Path,$written)
+        } else { [IO.File]::Delete($tmp) }
+        return [pscustomobject]$stats
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        if ($writer) { $writer.Dispose() }
+        if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) }
+    }
+}
+function Update-RolloutForTarget([string]$Path,[string]$Provider,[string]$Model,[string]$Effort,[switch]$Reference) {
+    if ($Reference) { return Update-RolloutForTargetReference $Path $Provider $Model $Effort }
+    Initialize-SqliteInterop
+    $created = [IO.File]::GetCreationTimeUtc($Path)
+    $written = [IO.File]::GetLastWriteTimeUtc($Path)
+    $result = $null
+    try {
+        $result = [CodexSwitcherRollout]::RewriteFile($Path,$Provider,$Model,$Effort)
+    } catch {
+        $inner = $_.Exception
+        if ($inner.InnerException) { $inner = $inner.InnerException }
+        if ($inner -is [CodexSwitcherRolloutFormatException]) {
+            throw ('会话文件第 ' + $inner.LineNumber + ' 行不是有效 JSON：' + $Path)
+        }
+        throw
+    }
+    try {
+        if ($result.Changed) {
+            [IO.File]::Replace($result.TempPath,$Path,[Management.Automation.Language.NullString]::Value)
+            [IO.File]::SetCreationTimeUtc($Path,$created)
+            [IO.File]::SetLastWriteTimeUtc($Path,$written)
+        }
+    } finally {
+        if ($result.TempPath -and [IO.File]::Exists($result.TempPath)) { [IO.File]::Delete($result.TempPath) }
+    }
+    return [pscustomobject]@{
+        RouteChanges=$result.RouteChanges
+        CompatibilityChanges=$result.CompatibilityChanges
+        Lines=$result.Lines
+        ChangedLines=$result.ChangedLines
+    }
+}
+function Get-RolloutHeader([string]$Path) {
+    $line = Get-Content -LiteralPath $Path -TotalCount 1
+    try { return ($line | ConvertFrom-Json) }
+    catch { throw "会话文件首行不是有效 JSON：$Path" }
+}
+function Find-RolloutOrdinalOffset([string]$Path,[long]$Ordinal) {
+    Initialize-SqliteInterop
+    $offset = [CodexSwitcherRollout]::FindOrdinalOffset($Path,$Ordinal)
+    if ($offset -lt 0) { return $null }
+    return $offset
+}
+function Set-HistoryBaseOffset([string]$Path,[long]$Offset) {
+    $created = [IO.File]::GetCreationTimeUtc($Path)
+    $written = [IO.File]::GetLastWriteTimeUtc($Path)
+    $source = [IO.File]::OpenRead($Path)
+    $bytes = New-Object 'Collections.Generic.List[byte]'
+    try {
+        while (($value=$source.ReadByte()) -ne -1) { if ($value -eq 10) { break }; $bytes.Add([byte]$value) }
+        $hadNewline = ($value -eq 10)
+        $firstBytes = $bytes.ToArray()
+        $newline = if ($firstBytes.Length -gt 0 -and $firstBytes[$firstBytes.Length-1] -eq 13) { "`r`n" } else { "`n" }
+        if ($newline -eq "`r`n") { $firstBytes = $firstBytes[0..($firstBytes.Length-2)] }
+        $first = $script:Utf8.GetString($firstBytes)
+        try { $header = $first | ConvertFrom-Json } catch { throw "分叉会话首行不是有效 JSON：$Path" }
+        if (!$header.payload.history_base -or !$header.payload.history_base.PSObject.Properties['end_byte_offset']) {
+            throw "分叉会话缺少 history_base.end_byte_offset：$Path"
+        }
+        $header.payload.history_base.end_byte_offset = $Offset
+        $updated = $script:Utf8.GetBytes(($header | ConvertTo-Json -Compress -Depth 100))
+        $tmp = $Path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+        $destination = [IO.File]::Create($tmp)
+        try {
+            $destination.Write($updated,0,$updated.Length)
+            if ($hadNewline) {
+                $separator = $script:Utf8.GetBytes($newline)
+                $destination.Write($separator,0,$separator.Length)
+                $source.CopyTo($destination)
+            }
+        } finally { $destination.Dispose() }
+    } finally { $source.Dispose() }
+    try {
+        [IO.File]::Replace($tmp,$Path,[Management.Automation.Language.NullString]::Value)
+        [IO.File]::SetCreationTimeUtc($Path,$created)
+        [IO.File]::SetLastWriteTimeUtc($Path,$written)
+    } finally { if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) } }
+}
+function Repair-ForkHistoryOffsets($RolloutEntries) {
+    $byId = @{}
+    $items = New-Object 'Collections.Generic.List[object]'
+    foreach ($entry in @($RolloutEntries)) {
+        $header = Get-RolloutHeader $entry.Original
+        $id = [string]$header.payload.id
+        $item = [pscustomobject]@{ Path=$entry.Original; Name=[IO.Path]::GetFileName($entry.Original); Id=$id; Header=$header }
+        $items.Add($item)
+        if ($id) {
+            if (!$byId.ContainsKey($id)) { $byId[$id]=New-Object 'Collections.Generic.List[object]' }
+            $byId[$id].Add($item)
+        }
+    }
+    $fixed = 0
+    foreach ($item in @($items.ToArray() | Sort-Object Name)) {
+        $base = $item.Header.payload.history_base
+        if (!$base -or !$base.PSObject.Properties['end_byte_offset'] -or !$base.PSObject.Properties['end_ordinal_exclusive']) { continue }
+        $sourceId = [string]$base.thread_id
+        if (!$byId.ContainsKey($sourceId)) { throw "分叉会话找不到源会话 $sourceId，已取消并恢复备份：$($item.Path)" }
+        $candidates = @($byId[$sourceId].ToArray() | Where-Object { $_.Path -ne $item.Path } | Sort-Object Name -Descending)
+        if ($candidates.Count -eq 0) { throw "分叉会话没有可用源文件 $sourceId，已取消并恢复备份：$($item.Path)" }
+        $newOffset = $null
+        foreach ($candidate in $candidates) {
+            $newOffset = Find-RolloutOrdinalOffset $candidate.Path ([long]$base.end_ordinal_exclusive)
+            if ($null -ne $newOffset) { break }
+        }
+        if ($null -eq $newOffset) { throw "无法重算分叉会话字节位置，已取消并恢复备份：$($item.Path)" }
+        if ([long]$base.end_byte_offset -ne [long]$newOffset) {
+            Set-HistoryBaseOffset $item.Path ([long]$newOffset)
+            $fixed++
+            $item.Header = Get-RolloutHeader $item.Path
+        }
+    }
+    return $fixed
+}
+function Restore-ChatMigration($Migration) {
+    if (!$Migration) { return }
+    $errors = New-Object 'Collections.Generic.List[string]'
+    if ($Migration.DatabasePath -and $Migration.DatabaseBackup -and (Test-Path -LiteralPath $Migration.DatabaseBackup)) {
+        try {
+            Initialize-SqliteInterop
+            [CodexSwitcherSqlite]::Restore($Migration.DatabaseBackup,$Migration.DatabasePath)
+        } catch { $errors.Add('数据库恢复失败：' + $_.Exception.Message) }
+    }
+    if ($Migration.ProjectionPath -and $Migration.ProjectionBackup -and (Test-Path -LiteralPath $Migration.ProjectionBackup)) {
+        try {
+            Initialize-SqliteInterop
+            [CodexSwitcherSqlite]::Restore($Migration.ProjectionBackup,$Migration.ProjectionPath)
+        } catch { $errors.Add('会话投影缓存恢复失败：' + $_.Exception.Message) }
+    }
+    foreach ($entry in @($Migration.Rollouts)) {
+        try {
+            if (Test-Path -LiteralPath $entry.Backup) {
+                Copy-Item -LiteralPath $entry.Backup -Destination $entry.Original -Force
+            }
+        } catch { $errors.Add('会话文件恢复失败：' + $entry.Original + '；' + $_.Exception.Message) }
+    }
+    if ($errors.Count -gt 0) { throw ($errors -join "`r`n") }
+}
+function Migrate-AllChats([string]$CodexRoot,[string]$Provider,[string]$Model,[string]$Effort,[string]$BackupRoot) {
+    $script:TimingRows = $null
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    if ($Provider -notmatch '^[A-Za-z0-9_.-]+$' -or $Model -notmatch '^[A-Za-z0-9_./:-]+$' -or $Effort -notmatch '^[A-Za-z0-9_.-]+$') {
+        throw '目标 provider 或模型名称格式无效，未迁移会话。'
+    }
+    Report-Progress 2 '正在扫描会话文件…'
+    $database = Find-CodexStateDatabase $CodexRoot
+    $projection = Find-CodexProjectionDatabase $CodexRoot
+    $rolloutFiles = @(Get-RolloutFiles $CodexRoot)
+    if (!$database -and $rolloutFiles.Count -eq 0) {
+        return [pscustomobject]@{ DatabasePath=$null; DatabaseBackup=$null; DatabaseRows=0; ProjectionPath=$null; ProjectionBackup=$null; ProjectionRows=0; Rollouts=@(); RolloutCount=0; RouteChanges=0; CompatibilityChanges=0; ForksRemapped=0; BackupRoot=$BackupRoot }
+    }
+    if (!$database) { throw '发现会话文件，但没有找到包含 threads 表的 Codex state 数据库。未做修改。' }
+    $null = New-Item -ItemType Directory -Path $BackupRoot -Force
+    $rolloutBackups = New-Object 'Collections.Generic.List[object]'
+    foreach ($file in $rolloutFiles) {
+        $full = [IO.Path]::GetFullPath($file.FullName)
+        $root = [IO.Path]::GetFullPath($CodexRoot).TrimEnd('\') + '\'
+        if (!$full.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)) { throw "会话路径不在 Codex 根目录内：$full" }
+        $relative = $full.Substring($root.Length)
+        $backup = Join-Path (Join-Path $BackupRoot 'rollouts') $relative
+        $null = New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($backup)) -Force
+        Copy-Item -LiteralPath $full -Destination $backup -Force
+        $line = Get-Content -LiteralPath $full -TotalCount 1
+        try { $header = $line | ConvertFrom-Json }
+        catch { throw "会话文件首行不是有效 JSON：$full" }
+        if ($header.type -ne 'session_meta' -or !$header.payload.PSObject.Properties['model_provider']) {
+            throw "会话文件缺少 session_meta.model_provider：$full"
+        }
+        $rolloutBackups.Add([pscustomobject]@{ Original=$full; Backup=$backup })
+    }
+    Add-SwitchTiming '备份会话文件' $watch.Elapsed.TotalMilliseconds ($rolloutFiles.Count.ToString() + ' 个文件')
+    Report-Progress 10 ('已备份 ' + $rolloutFiles.Count + ' 个会话文件')
+    $watch.Restart()
+    $databaseBackup = Join-Path $BackupRoot ([IO.Path]::GetFileName($database))
+    $projectionBackup = if ($projection) { Join-Path $BackupRoot ([IO.Path]::GetFileName($projection)) } else { $null }
+    $migration = [pscustomobject]@{
+        DatabasePath=$database
+        DatabaseBackup=$databaseBackup
+        DatabaseRows=0
+        ProjectionPath=$projection
+        ProjectionBackup=$projectionBackup
+        ProjectionRows=0
+        Rollouts=@($rolloutBackups.ToArray())
+        RolloutCount=0
+        RouteChanges=0
+        CompatibilityChanges=0
+        ForksRemapped=0
+        BackupRoot=$BackupRoot
+    }
+    try {
+        Initialize-SqliteInterop
+        $migration.DatabaseRows = [CodexSwitcherSqlite]::BackupAndUpdate($database,$databaseBackup,$Provider,$Model,$Effort)
+        Add-SwitchTiming 'SQLite 索引备份+更新' $watch.Elapsed.TotalMilliseconds ($migration.DatabaseRows.ToString() + ' 行')
+        Report-Progress 16 ('已更新 ' + $migration.DatabaseRows + ' 条会话索引')
+        $watch.Restart()
+        $fileIndex = 0
+        foreach ($entry in $migration.Rollouts) {
+            $fileIndex++
+            $stats = Update-RolloutForTarget $entry.Original $Provider $Model $Effort
+            $migration.RouteChanges += $stats.RouteChanges
+            $migration.CompatibilityChanges += $stats.CompatibilityChanges
+            $migration.RolloutCount++
+            $fileBytes = ([IO.FileInfo]$entry.Original).Length
+            $sizeText = if ($fileBytes -ge 1MB) { ([Math]::Round($fileBytes / 1MB, 2)).ToString() + ' MB' } else { ([Math]::Round($fileBytes / 1KB, 1)).ToString() + ' KB' }
+            Add-SwitchTiming ('改写会话 ' + $fileIndex + '/' + $migration.Rollouts.Count) $watch.Elapsed.TotalMilliseconds ($sizeText + '，路由 ' + $stats.RouteChanges + '，兼容 ' + $stats.CompatibilityChanges)
+            $watch.Restart()
+            $percent = 16
+            if ($migration.Rollouts.Count -gt 0) { $percent = 16 + [int](64 * $fileIndex / $migration.Rollouts.Count) }
+            Report-Progress $percent ('改写会话 ' + $fileIndex + '/' + $migration.Rollouts.Count + '（' + $sizeText + '）')
+        }
+        $migration.ForksRemapped = Repair-ForkHistoryOffsets $migration.Rollouts
+        Add-SwitchTiming '修复 fork 偏移' $watch.Elapsed.TotalMilliseconds ($migration.ForksRemapped.ToString() + ' 处')
+        Report-Progress 84 '已修复 fork 偏移'
+        $watch.Restart()
+        if ($projection) {
+            $migration.ProjectionRows = [CodexSwitcherSqlite]::BackupAndClearProjection($projection,$projectionBackup)
+            Add-SwitchTiming '投影缓存备份+清空' $watch.Elapsed.TotalMilliseconds ($migration.ProjectionRows.ToString() + ' 行')
+        }
+        Report-Progress 94 '已重建会话投影缓存'
+        $manifest = @{
+            createdAt=(Get-Date).ToString('o')
+            targetProvider=$Provider
+            targetModel=$Model
+            targetReasoningEffort=$Effort
+            databasePath=$database
+            databaseRows=$migration.DatabaseRows
+            projectionPath=$projection
+            projectionRowsInvalidated=$migration.ProjectionRows
+            rolloutCount=$migration.RolloutCount
+            routeChanges=$migration.RouteChanges
+            compatibilityChanges=$migration.CompatibilityChanges
+            forksRemapped=$migration.ForksRemapped
+            rollouts=@($migration.Rollouts)
+        }
+        Atomic-Write (Join-Path $BackupRoot 'manifest.json') ($manifest | ConvertTo-Json -Depth 8)
+        return $migration
+    } catch {
+        try { Restore-ChatMigration $migration } catch { }
+        throw
+    }
+}
+function Switch-Mode([string]$ConfigPath,[string]$Mode,[string]$ApiBase,[string]$Model,[string]$Key,[string]$Catalog) {
+    Assert-Closed
+    $ConfigPath = [IO.Path]::GetFullPath($ConfigPath)
+    if ([IO.Path]::GetFileName($ConfigPath) -ne 'config.toml' -or !(Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { throw '请选择实际生效的 config.toml 文件。' }
+    $originalBytes = [IO.File]::ReadAllBytes($ConfigPath)
+    $original = [IO.File]::ReadAllText($ConfigPath)
+    $marker = '(?ms)^# CODEX-SWITCHER-BEGIN\r?\n.*?^# CODEX-SWITCHER-END\r?\n?'
+    $clean = [regex]::Replace($original,$marker,'')
+    $split = Split-Config $clean
+    $dir = Join-Path ([IO.Path]::GetDirectoryName($ConfigPath)) 'codex-switcher'
+    $state = Read-State $dir
+    $currentProvider = Root-Value $split.Root 'model_provider'
+    if ($original -match '(?m)^\s*profile\s*=') { throw '检测到旧版 profile 选择器。请先迁移该配置，工具未修改文件。' }
+    $catalogAdded = @()
+    $catalogIncomplete = $false
+    if ($Mode -eq 'deepseek') {
+        $uri = $null
+        if (![uri]::TryCreate($ApiBase,[UriKind]::Absolute,[ref]$uri) -or $uri.Scheme -ne 'https' -or $uri.UserInfo -or $uri.Query -or $uri.Fragment) { throw 'API 地址必须是有效的 HTTPS 基础地址，不得含密码、查询参数或片段。' }
+        if ($uri.Host -eq '127.0.0.1' -or $uri.Host -eq 'localhost') { throw '本工具使用直连 HTTPS 接口，不使用旧 CC Switch 地址。' }
+        $models = @(Split-ModelList $Model)
+        if ($models.Count -eq 0) { throw '请填写 DeepSeek 模型名称。' }
+        foreach ($name in $models) { if ($name -notmatch '^[A-Za-z0-9_./:-]+$') { throw ('模型名称格式无效：' + $name) } }
+        # 第一个为当前生效模型；其余只用于补进模型目录，方便在对话里下拉选择。
+        $Model = $models[0]
+        if ($Key -and $Key -match '\s') { throw 'API Key 不能包含空格或换行。' }
+        if (!$Key -and !(Test-Path -LiteralPath (Join-Path $dir 'deepseek.key'))) { throw '首次使用请填写 DeepSeek API Key。' }
+        if ($Catalog) {
+            $catalogObject = Read-CatalogObject $Catalog
+            if (!(Get-CompleteCatalogEntry $catalogObject)) { $catalogIncomplete = $true }
+            $catalogAdded = @(Add-CatalogModels $catalogObject $models)
+            if ($catalogAdded.Count -gt 0) {
+                $null = New-Item -ItemType Directory -Path $dir -Force
+                $null = Backup-CatalogFile $Catalog $dir
+                Atomic-Write $Catalog (Convert-ToLfText ($catalogObject | ConvertTo-Json -Depth 25))
+            }
+            if (!(@(Get-CatalogSlugs $catalogObject) -contains $Model)) { throw '模型目录中缺少当前模型，未做修改。' }
+        }
+        if ($state -and $currentProvider -in @('deepseek','codex_switcher_deepseek')) { $official = @($state.officialRoot) }
+        elseif (!$currentProvider -or $currentProvider -eq 'openai') { $official = @($split.Root) }
+        elseif ($state) { $official = @($state.officialRoot) }
+        else { throw '首次使用时请从当前官方登录配置开始，工具才能准确保存官方模型设置。' }
+        if ($clean -match '(?m)^\s*\[model_providers\.(deepseek|codex_switcher_deepseek)\]') { throw '配置中出现与工具保留名称重名的 DeepSeek provider。请先移除重名配置，再使用工具。' }
+    } else {
+        if (!$state) {
+            if (!$currentProvider -or $currentProvider -eq 'openai') { return '当前已经是官方配置，无需修改。' }
+            throw '未找到本工具保存的官方配置。请先手动完成官方登录，再使用本工具。'
+        }
+        $official = @($state.officialRoot)
+        $ApiBase = [string]$state.apiBase
+        $Model = [string]$state.model
+        $Catalog = [string]$state.catalog
+    }
+    # The bounded provider definitions remain in both modes so persisted DeepSeek threads can resume.
+    $helper = Join-Path $dir 'credential-helper.ps1'
+    $keyPath = Join-Path $dir 'deepseek.key'
+    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $providerLines = @(
+        '# CODEX-SWITCHER-BEGIN',
+        '[model_providers.deepseek]',
+        'name = "DeepSeek"',
+        ('base_url = ' + (Quote-Toml $ApiBase.TrimEnd('/'))),
+        'wire_api = "responses"',
+        '[model_providers.deepseek.auth]',
+        ('command = ' + (Quote-Toml $psExe)),
+        ('args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ' + (Quote-Toml $helper) + ', "-EmitKey", "-KeyFile", ' + (Quote-Toml $keyPath) + ']'),
+        'timeout_ms = 10000',
+        'refresh_interval_ms = 0',
+        '',
+        '# Compatibility alias for chats created by Codex Switcher v1.',
+        '[model_providers.codex_switcher_deepseek]',
+        'name = "DeepSeek (Switcher v1 compatibility)"',
+        ('base_url = ' + (Quote-Toml $ApiBase.TrimEnd('/'))),
+        'wire_api = "responses"',
+        '[model_providers.codex_switcher_deepseek.auth]',
+        ('command = ' + (Quote-Toml $psExe)),
+        ('args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ' + (Quote-Toml $helper) + ', "-EmitKey", "-KeyFile", ' + (Quote-Toml $keyPath) + ']'),
+        'timeout_ms = 10000',
+        'refresh_interval_ms = 0',
+        '# CODEX-SWITCHER-END'
+    )
+    $extra = $providerLines -join "`r`n"
+    if ($Mode -eq 'deepseek') {
+        $roots = @('model_provider = "deepseek"', ('model = ' + (Quote-Toml $Model)), 'model_reasoning_effort = "high"', 'web_search = "disabled"')
+        # web_search must also be treated as switchable to avoid duplicate top-level keys.
+        if ($Catalog) { $roots += 'model_catalog_json = ' + (Quote-Toml (Join-Path $dir 'deepseek-models.json')) }
+        $updated = Make-Config $clean $roots ($extra + "`r`n")
+    } else { $updated = Make-Config $clean $official ($extra + "`r`n") }
+    $null = New-Item -ItemType Directory -Path $dir -Force
+    $backupDir = Join-Path $dir 'backups'
+    $null = New-Item -ItemType Directory -Path $backupDir -Force
+    $backup = Join-Path $backupDir ((Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' + [guid]::NewGuid().ToString('N').Substring(0,6) + '.toml')
+    [IO.File]::WriteAllBytes($backup,$originalBytes)
+    if ($Mode -eq 'deepseek') {
+        Copy-Item -LiteralPath $script:SourceScript -Destination $helper -Force
+        if ($Key) { Atomic-Write $keyPath (ConvertFrom-SecureString (ConvertTo-SecureString $Key -AsPlainText -Force)) }
+        if ($Catalog) { Atomic-Write (Join-Path $dir 'deepseek-models.json') (Convert-ToLfText ([IO.File]::ReadAllText($Catalog))) }
+    }
+    $nextState = @{ officialRoot=@($official); mode=$Mode; apiBase=$ApiBase; model=$Model; catalog=$Catalog; lastBackup=$backup }
+    if ($Mode -eq 'deepseek') {
+        $targetProvider = 'deepseek'
+        $targetModel = $Model
+        $targetEffort = 'high'
+    } else {
+        $targetProvider = 'openai'
+        $targetModel = [string](Root-Value $official 'model')
+        if (!$targetModel) { throw '保存的官方配置没有明确模型，无法安全迁移旧会话。' }
+        $targetEffort = [string](Root-Value $official 'model_reasoning_effort')
+        if (!$targetEffort) { $targetEffort = 'medium' }
+    }
+    # Recheck before touching chat state so application writes aren't silently lost.
+    if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($ConfigPath)) -ne [Convert]::ToBase64String($originalBytes)) { throw '配置在切换期间被其他程序修改，已取消；请退出应用后重试。' }
+    Assert-Closed
+    $chatBackupRoot = Join-Path (Join-Path $dir 'chat-backups') ((Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+    $migration = Migrate-AllChats ([IO.Path]::GetDirectoryName($ConfigPath)) $targetProvider $targetModel $targetEffort $chatBackupRoot
+    $null = New-Item -ItemType Directory -Path $chatBackupRoot -Force
+    $statePath = Join-Path $dir 'state.json'
+    $stateBackup = $null
+    if (Test-Path -LiteralPath $statePath) {
+        $stateBackup = Join-Path $chatBackupRoot 'state.json.before-switch'
+        Copy-Item -LiteralPath $statePath -Destination $stateBackup -Force
+    }
+    try {
+        Assert-Closed
+        Atomic-Write $statePath ($nextState | ConvertTo-Json -Depth 6)
+        Atomic-Write $ConfigPath $updated
+    } catch {
+        try { Restore-ChatMigration $migration } catch { }
+        try { Copy-Item -LiteralPath $backup -Destination $ConfigPath -Force } catch { }
+        try {
+            if ($stateBackup) { Copy-Item -LiteralPath $stateBackup -Destination $statePath -Force }
+            elseif (Test-Path -LiteralPath $statePath) { Remove-Item -LiteralPath $statePath -Force }
+        } catch { }
+        throw
+    }
+    $timingText = Format-SwitchTiming
+    $totalSeconds = [Math]::Round((Get-SwitchTimingTotalMs) / 1000, 2)
+    $timingLog = Join-Path $dir 'switch-timing.log'
+    if ($timingText) {
+        $entry = '=== ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '  切到 ' + $Mode + '（' + $targetProvider + ' / ' + $targetModel + ' / ' + $targetEffort + '）' + "`r`n" + $timingText + "`r`n  合计 " + $totalSeconds + " 秒`r`n`r`n"
+        try { [IO.File]::AppendAllText($timingLog,$entry,$script:Utf8) } catch { }
+    }
+    Write-Log $dir ('Switched to ' + $Mode + '; backup=' + $backup + '; totalMs=' + [Math]::Round((Get-SwitchTimingTotalMs),0))
+    Report-Progress 100 '完成'
+    $catalogNote = ''
+    if ($Mode -eq 'deepseek') {
+        if ($catalogAdded.Count -gt 0) {
+            $catalogNote = "`r`n已把新模型写进模型目录并同步到生效副本：" + ($catalogAdded -join '、')
+        }
+        if ($catalogIncomplete) {
+            $catalogNote += "`r`n注意：这个目录里的条目缺少 Codex 需要的能力元数据；新条目已按工具自带目录补齐，"
+            $catalogNote += "但原有条目本身没有补。如果 Codex 启动报模型目录错误，请改用工具自带目录，或按自带条目的字段补齐。"
+        }
+        if ($Catalog) { $catalogNote += "`r`n模型目录：$Catalog（原文件已备份到 codex-switcher\catalog-backups）" }
+        else { $catalogNote += "`r`n未指定模型目录：对话里的模型下拉可能列不出这个模型，但请求仍按 $targetModel 发送。" }
+    }
+    return "切换成功，耗时 $totalSeconds 秒。现在请重新打开 Codex。`r`n已将 $($migration.DatabaseRows) 条会话索引和 $($migration.RolloutCount) 个现有会话文件切到 $targetProvider / $targetModel（$targetEffort）。`r`n兼容字段处理 $($migration.CompatibilityChanges) 处，fork 偏移修复 $($migration.ForksRemapped) 个，投影缓存失效 $($migration.ProjectionRows) 行。`r`n可见历史消息、官方登录凭证、skills 和 MCP 均保留。$catalogNote`r`n配置备份：$backup`r`n会话备份：$($migration.BackupRoot)`r`n耗时明细：$timingLog"
+}
+function Get-CheckRootKey([string[]]$Lines,[string]$Name) {
+    foreach ($line in $Lines) {
+        $trim = $line.Trim()
+        if ($trim.StartsWith('[')) { return $null }
+        $match = [regex]::Match($trim,'^' + [regex]::Escape($Name) + '\s*=\s*"([^"]*)"')
+        if ($match.Success) { return $match.Groups[1].Value }
+    }
+    return $null
+}
+function Get-CheckProviderSection([string[]]$Lines,[string]$Provider) {
+    $header = '[model_providers.' + $Provider + ']'
+    $inside = $false
+    $found = @{}
+    foreach ($line in $Lines) {
+        $trim = $line.Trim()
+        if ($trim.StartsWith('[')) { $inside = ($trim -eq $header); continue }
+        if (!$inside) { continue }
+        $match = [regex]::Match($trim,'^(base_url|wire_api|name)\s*=\s*"([^"]*)"')
+        if ($match.Success) { $found[$match.Groups[1].Value] = $match.Groups[2].Value }
+    }
+    return $found
+}
+function Get-CheckConfigInfo([string]$Root) {
+    $path = Join-Path $Root 'config.toml'
+    $info = [pscustomobject]@{
+        Path=$path; Provider='?'; Model='?'; Effort=''
+        BaseUrl='（未配置，由官方登录提供）'; Wire='ChatGPT 官方登录'
+    }
+    if (!(Test-Path -LiteralPath $path -PathType Leaf)) { return $info }
+    $lines = [IO.File]::ReadAllLines($path,$script:Utf8)
+    $provider = Get-CheckRootKey $lines 'model_provider'
+    if ($provider) { $info.Provider = $provider }
+    $model = Get-CheckRootKey $lines 'model'
+    if ($model) { $info.Model = $model }
+    $effort = Get-CheckRootKey $lines 'model_reasoning_effort'
+    if ($effort) { $info.Effort = $effort }
+    if ($provider) {
+        $section = Get-CheckProviderSection $lines $provider
+        if ($section.ContainsKey('base_url')) { $info.BaseUrl = $section['base_url'] }
+        $wire = if ($section.ContainsKey('wire_api')) { $section['wire_api'] } else { 'responses' }
+        $info.Wire = 'wire_api=' + $wire
+    }
+    return $info
+}
+function Get-CheckRolloutFiles([string]$Root) {
+    $list = New-Object 'Collections.Generic.List[IO.FileInfo]'
+    foreach ($name in @('sessions','archived_sessions')) {
+        $dir = Join-Path $Root $name
+        if (Test-Path -LiteralPath $dir -PathType Container) {
+            foreach ($file in @(Get-ChildItem -LiteralPath $dir -Filter 'rollout-*.jsonl' -File -Recurse -ErrorAction SilentlyContinue)) {
+                $list.Add($file)
+            }
+        }
+    }
+    return @($list.ToArray())
+}
+function Open-CheckReader([string]$Path) {
+    $last = $null
+    for ($attempt = 0; $attempt -lt 5; $attempt++) {
+        try {
+            $handle = [IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
+            return (New-Object IO.StreamReader($handle,$script:Utf8,$true,65536))
+        } catch {
+            $last = $_
+            Start-Sleep -Milliseconds 250
+        }
+    }
+    throw ('无法读取会话文件（可能正被 Codex 写入）：' + $Path + '；' + $last.Exception.Message)
+}
+function Get-CheckHeader([string]$Path) {
+    $reader = Open-CheckReader $Path
+    try { $line = $reader.ReadLine() } finally { $reader.Dispose() }
+    try { return ($line | ConvertFrom-Json).payload } catch { return $null }
+}
+function Get-CheckFingerprint([string]$Id) {
+    if ($Id -match '^resp_[0-9a-fA-F]{16,}$') { return 'OpenAI官方(resp_)' }
+    if ($Id -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') { return 'UUID(非OpenAI官方)' }
+    return '其他格式'
+}
+function Get-CheckProviderLabel([string]$Kind) {
+    if ($Kind -like 'OpenAI官方*') { return 'OpenAI 官方' }
+    if ($Kind -like 'UUID*') { return 'DeepSeek（第三方接口）' }
+    return '未知来源'
+}
+function Read-CheckResponseIds([string]$Path,[int]$TailBytes=0,[int]$MaxCount=0) {
+    $list = New-Object 'Collections.Generic.List[object]'
+    $handle = [IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
+    try {
+        $skipFirst = $false
+        if ($TailBytes -gt 0 -and $handle.Length -gt $TailBytes) {
+            $handle.Seek($handle.Length - $TailBytes,[IO.SeekOrigin]::Begin) | Out-Null
+            $skipFirst = $true
+        }
+        $reader = New-Object IO.StreamReader($handle,$script:Utf8,$true,65536)
+        try {
+            $first = $true
+            while (($line = $reader.ReadLine()) -ne $null) {
+                if ($first) { $first = $false; if ($skipFirst) { continue } }
+                if ($line.IndexOf('"response_id"',[StringComparison]::Ordinal) -lt 0) { continue }
+                $record = $null
+                try { $record = $line | ConvertFrom-Json } catch { continue }
+                if (!$record -or !$record.payload) { continue }
+                $id = [string]$record.payload.response_id
+                if (!$id) { continue }
+                $when = $null
+                try { $when = ([datetimeoffset]::Parse([string]$record.timestamp)).LocalDateTime } catch { }
+                $list.Add([pscustomobject]@{ Ts=$when; Id=$id })
+            }
+        } finally { $reader.Dispose() }
+    } finally { $handle.Dispose() }
+    $items = @($list.ToArray())
+    if ($MaxCount -gt 0 -and $items.Count -gt $MaxCount) {
+        return @($items[($items.Count - $MaxCount)..($items.Count - 1)])
+    }
+    return $items
+}
+function Format-CheckWhen($Value) {
+    if ($null -eq $Value) { return '??:??:??' }
+    return ([datetime]$Value).ToString('HH:mm:ss')
+}
+function Get-CheckThreadRuntime([string]$Path,[int]$MaxScanBytes = 8388608) {
+    # 对话界面里选的模型存在会话自己的运行时设置里（turn_context / thread_settings_applied），
+    # 与 config.toml 的默认模型是两回事。这里从文件末尾向前找最后一条运行时记录。
+    $result = [pscustomobject]@{ Found=$false; Model=''; Provider=''; Effort=''; When=$null }
+    if (!$Path -or !(Test-Path -LiteralPath $Path -PathType Leaf)) { return $result }
+    $length = ([IO.FileInfo]$Path).Length
+    if ($length -le 0) { return $result }
+    $window = [int][Math]::Min([double]$MaxScanBytes,[double]$length)
+    $handle = [IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
+    try {
+        $handle.Seek($length - $window,[IO.SeekOrigin]::Begin) | Out-Null
+        $buffer = New-Object byte[] $window
+        $read = 0
+        while ($read -lt $window) {
+            $n = $handle.Read($buffer,$read,$window - $read)
+            if ($n -le 0) { break }
+            $read += $n
+        }
+    } finally { $handle.Dispose() }
+    $lines = [regex]::Split($script:Utf8.GetString($buffer,0,$read),'\r?\n')
+    for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+        $line = $lines[$i]
+        $isTurn = $line.IndexOf('"turn_context"',[StringComparison]::Ordinal) -ge 0
+        $isSettings = $line.IndexOf('thread_settings_applied',[StringComparison]::Ordinal) -ge 0
+        if (!$isTurn -and !$isSettings) { continue }
+        $record = $null
+        try { $record = $line | ConvertFrom-Json } catch { continue }
+        if (!$record -or !$record.payload) { continue }
+        if ($isTurn -and $record.type -eq 'turn_context') {
+            if (!$result.Model -and $record.payload.model) { $result.Model = [string]$record.payload.model }
+            if (!$result.Effort -and $record.payload.effort) { $result.Effort = [string]$record.payload.effort }
+            if (!$result.When) { try { $result.When = ([datetimeoffset]::Parse([string]$record.timestamp)).LocalDateTime } catch { } }
+        } elseif ($record.type -eq 'event_msg' -and $record.payload.PSObject.Properties['thread_settings']) {
+            $settings = $record.payload.thread_settings
+            if (!$result.Model -and $settings.model) { $result.Model = [string]$settings.model }
+            if (!$result.Provider -and $settings.model_provider_id) { $result.Provider = [string]$settings.model_provider_id }
+            if (!$result.Effort -and $settings.reasoning_effort) { $result.Effort = [string]$settings.reasoning_effort }
+            if (!$result.When) { try { $result.When = ([datetimeoffset]::Parse([string]$record.timestamp)).LocalDateTime } catch { } }
+        }
+        # 最后一次出现的运行时记录即当前选择；provider 缺失时继续向前找 settings 记录补齐。
+        if ($result.Model -and $result.Provider) { break }
+    }
+    $result.Found = [bool]$result.Model
+    return $result
+}
+function Get-ProviderSnapshot([string]$CodexRoot,[int]$Recent=6,[int]$TailBytes=262144,[switch]$Full) {
+    $root = [IO.Path]::GetFullPath($CodexRoot)
+    $config = Get-CheckConfigInfo $root
+    $lines = New-Object 'Collections.Generic.List[string]'
+    $lines.Add('配置文件      : ' + $config.Path)
+    $lines.Add('新对话默认模型: ' + $config.Model + '   （来自 config.toml，只影响新建对话）')
+    $lines.Add('新对话默认来源: ' + $config.Provider)
+    if ($config.Effort) { $lines.Add('默认推理强度  : ' + $config.Effort) }
+    $lines.Add('接口地址      : ' + $config.BaseUrl)
+    $lines.Add('认证方式      : ' + $config.Wire)
+    $lines.Add('')
+    $result = [pscustomobject]@{
+        Lines=$lines.ToArray(); Provider=$config.Provider; Model=$config.Model; BaseUrl=$config.BaseUrl
+        ThreadId=''; ThreadFile=''; OriginModel=''; LastId=''; LastKind=''
+        ThreadModel=''; ThreadProvider=''; ThreadEffort=''
+        Headline='未找到会话文件'; Conclusion='无法判断'
+    }
+    $files = @(Get-CheckRolloutFiles $root)
+    if ($files.Count -eq 0) {
+        $lines.Add('没有找到会话文件（rollout-*.jsonl）。先让 Codex 产生一次对话，再刷新。')
+        $result.Lines = $lines.ToArray()
+        return $result
+    }
+    $target = @($files | Sort-Object LastWriteTime -Descending | Select-Object -First 1)[0]
+    $header = Get-CheckHeader $target.FullName
+    $threadId = if ($header) { [string]$header.id } else { '?' }
+    $origin = if ($header -and $header.base_instructions -and $header.base_instructions.provenance -and $header.base_instructions.provenance.model) {
+        [string]$header.base_instructions.provenance.model
+    } else { '（未记录）' }
+    $lines.Add('会话文件      : ' + $target.Name)
+    $lines.Add('会话 ID       : ' + $threadId)
+    $runtime = Get-CheckThreadRuntime $target.FullName
+    $result.ThreadModel = [string]$runtime.Model
+    $result.ThreadProvider = [string]$runtime.Provider
+    $result.ThreadEffort = [string]$runtime.Effort
+    if ($runtime.Found) {
+        $providerText = if ($runtime.Provider) { $runtime.Provider } else { '（未记录）' }
+        $effortText = if ($runtime.Effort) { $runtime.Effort } else { '（未记录）' }
+        $whenText = if ($runtime.When) { '  记录于 ' + (Format-CheckWhen $runtime.When) } else { '' }
+        $lines.Add('本对话实际模型: ' + $runtime.Model + '   provider=' + $providerText + '   推理=' + $effortText + '   （会话运行时记录，即对话里选的那个）' + $whenText)
+    } else {
+        $lines.Add('本对话实际模型: （这个会话文件里还没有运行时记录；先在 Codex 里发一条消息或改一次模型再刷新）')
+    }
+    $lines.Add('创建时模型    : ' + $origin + '  （取自会话头，切换工具不会修改，可交叉验证）')
+    if ($runtime.Found -and $runtime.Model -and $config.Model -and $runtime.Model -ne $config.Model) {
+        $lines.Add('提示          : 本对话用的是 ' + $runtime.Model + '；config.toml 的 ' + $config.Model + ' 只影响新建对话。')
+    }
+    if ($runtime.Found -and $runtime.Provider -and $config.Provider -and $config.Provider -ne '?' -and $runtime.Provider -ne $config.Provider) {
+        $lines.Add('提示          : 本对话记录的 provider 是 ' + $runtime.Provider + '，与 config.toml 的 ' + $config.Provider + ' 不同。')
+    }
+    $lines.Add('')
+    $window = @(Read-CheckResponseIds $target.FullName $TailBytes 0)
+    $result.ThreadId = $threadId
+    $result.ThreadFile = $target.FullName
+    $result.OriginModel = $origin
+    if ($window.Count -eq 0) {
+        $lines.Add('这个会话还没有服务端签发的响应 ID，无法判断。先在 Codex 里发一条消息再刷新。')
+        $result.Lines = $lines.ToArray()
+        $result.Headline = '尚无响应记录'
+        return $result
+    }
+    $recentEntries = if ($window.Count -gt $Recent) { @($window[($window.Count - $Recent)..($window.Count - 1)]) } else { $window }
+    $latest = $window[$window.Count - 1]
+    $latestKind = Get-CheckFingerprint $latest.Id
+    $result.LastId = $latest.Id
+    $result.LastKind = $latestKind
+    $lines.Add('最近 ' + $recentEntries.Count + ' 次请求（响应 ID 由对方服务器签发）：')
+    foreach ($entry in $recentEntries) {
+        $lines.Add('  ' + (Format-CheckWhen $entry.Ts) + '  ' + $entry.Id + '  ' + (Get-CheckFingerprint $entry.Id))
+    }
+    $lines.Add('')
+    $counts = @{}
+    foreach ($entry in $window) {
+        $key = Get-CheckFingerprint $entry.Id
+        if (!$counts.ContainsKey($key)) { $counts[$key] = 0 }
+        $counts[$key]++
+    }
+    $parts = New-Object 'Collections.Generic.List[string]'
+    foreach ($key in @($counts.Keys)) { $parts.Add($key + ' x ' + $counts[$key]) }
+    $lines.Add('尾部窗口统计（最近 ' + $window.Count + ' 次）: ' + ($parts.ToArray() -join '  +  '))
+    if ($Full) {
+        $allEntries = @(Read-CheckResponseIds $target.FullName 0 0)
+        if ($allEntries.Count -gt 0) {
+            $lines.Add('')
+            $lines.Add('完整时间线（全部 ' + $allEntries.Count + ' 次请求）：')
+            $runs = New-Object 'Collections.Generic.List[object]'
+            foreach ($entry in $allEntries) {
+                $key = Get-CheckFingerprint $entry.Id
+                if ($runs.Count -gt 0 -and $runs[$runs.Count - 1].Kind -eq $key) {
+                    $runs[$runs.Count - 1].Count++
+                    $runs[$runs.Count - 1].Last = $entry.Ts
+                } else {
+                    $runs.Add([pscustomobject]@{ Kind=$key; First=$entry.Ts; Last=$entry.Ts; Count=1 })
+                }
+            }
+            foreach ($run in $runs) {
+                $lines.Add('  ' + ([datetime]$run.First).ToString('MM-dd HH:mm:ss') + ' ~ ' + ([datetime]$run.Last).ToString('MM-dd HH:mm:ss') + '   ' + ([string]$run.Kind).PadRight(22) + ([string]$run.Count).PadLeft(5) + ' 次')
+            }
+        }
+    }
+    $lines.Add('')
+    $label = Get-CheckProviderLabel $latestKind
+    $threadModelText = if ($result.ThreadModel) { $result.ThreadModel } else { '（未记录）' }
+    $threadText = '本对话模型 ' + $threadModelText
+    if ($latestKind -like 'OpenAI官方*') {
+        $result.Conclusion = '请求由 OpenAI 官方回答'
+        $lines.Add('结论：最近一次请求由 OpenAI 官方后端回答（响应 ID 为官方 resp_ 格式；' + $threadText + '）。')
+    } elseif ($latestKind -like 'UUID*') {
+        $result.Conclusion = '请求发往 ' + $config.Provider
+        $lines.Add('结论：最近一次请求的响应 ID 是 UUID 格式，不是 OpenAI 官方格式。')
+        $lines.Add('      请求发往 ' + $label + '，本对话 ' + $config.Provider + ' / ' + $threadModelText + ' -> ' + $config.BaseUrl + '，未发往 OpenAI 官方。')
+    } else {
+        $result.Conclusion = '无法判定'
+        $lines.Add('结论：最近一次响应 ID 为其他格式（' + $latest.Id + '），无法据此判定。')
+    }
+    $lines.Add('')
+    $lines.Add('提示：响应 ID 由对方服务器签发，本切换工具从不修改它，所以它能反映真实回答来源；')
+    $lines.Add('      若第三方接口刻意模仿官方格式，指纹会失真，可用 Clash 的“连接”页看目标域名交叉验证。')
+    $result.Lines = $lines.ToArray()
+    $result.Headline = '最近请求：' + $label + '   ' + (Format-CheckWhen $latest.Ts)
+    return $result
+}
+function Add-ProviderWatchLog([string]$CodexRoot,$Snapshot) {
+    try {
+        $dir = Join-Path $CodexRoot 'codex-switcher'
+        $null = New-Item -ItemType Directory -Path $dir -Force
+        $thread = if ($Snapshot.ThreadModel) { $Snapshot.ThreadModel } else { '（未记录）' }
+        $line = '{0}  provider={1}  model={2}  base_url={3}  会话={4}  响应ID={5}  对话模型={6}  {7}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'),$Snapshot.Provider,$Snapshot.Model,$Snapshot.BaseUrl,$Snapshot.ThreadId,$Snapshot.LastId,$thread,$Snapshot.LastKind
+        [IO.File]::AppendAllText((Join-Path $dir 'provider-watch.log'),$line + "`r`n",$script:Utf8)
+    } catch { }
+}
+$script:ManagedKeys += 'web_search'
+if ($LibraryOnly) { return }
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+[Windows.Forms.Application]::EnableVisualStyles()
+$form = New-Object Windows.Forms.Form
+$form.Text = 'Codex 配置切换 — 官方 / DeepSeek'
+$form.ClientSize = New-Object Drawing.Size(690,578)
+$form.StartPosition = 'CenterScreen'
+$form.FormBorderStyle = 'FixedDialog'
+$form.MaximizeBox = $false
+$form.Font = New-Object Drawing.Font('Microsoft YaHei UI',10)
+function Label([string]$Text,[int]$Y) {
+    $control = New-Object Windows.Forms.Label
+    $control.Text=$Text; $control.Location=New-Object Drawing.Point(20,$Y); $control.Size=New-Object Drawing.Size(645,26)
+    $form.Controls.Add($control)
+}
+function TextBox([int]$Y,[string]$Value,[int]$Width=550) {
+    $control=New-Object Windows.Forms.TextBox
+    $control.Text=$Value; $control.Location=New-Object Drawing.Point(20,$Y); $control.Size=New-Object Drawing.Size($Width,28)
+    $form.Controls.Add($control); return $control
+}
+function Browse($Target,[string]$Filter) {
+    $dialog=New-Object Windows.Forms.OpenFileDialog
+    $dialog.Filter=$Filter
+    if ($dialog.ShowDialog() -eq 'OK') { $Target.Text=$dialog.FileName }
+    $dialog.Dispose()
+}
+Label '1. 先正常退出 Codex，再选择当前实际使用的配置文件' 15
+$defaultHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+$configBox=TextBox 45 (Join-Path $defaultHome 'config.toml')
+$browseConfig=New-Object Windows.Forms.Button
+$browseConfig.Text='选择文件'; $browseConfig.SetBounds(580,43,90,31)
+$browseConfig.Add_Click({ Browse $configBox 'Codex 配置|config.toml' })
+$form.Controls.Add($browseConfig)
+Label '2. DeepSeek 接口地址（仅需首次设置；须支持 Responses API）' 88
+$baseBox=TextBox 118 'https://api.deepseek.com' 650
+Label '模型名称（可自由填写，含以后新发布的模型；多个用逗号分隔，第一个生效）' 155
+$modelBox=TextBox 182 'deepseek-v4-flash' 650
+Label 'API Key（首次填写；后续留空沿用已保存密钥；不会显示或写入日志）' 220
+$keyBox=TextBox 248 '' 650
+$keyBox.UseSystemPasswordChar=$true
+Label '模型目录 JSON（新填写的模型会自动写进这个文件；一般不用改）' 285
+$catalogBox=TextBox 313 ''
+$browseCatalog=New-Object Windows.Forms.Button
+$browseCatalog.Text='选择文件'; $browseCatalog.SetBounds(580,311,90,31)
+$browseCatalog.Add_Click({ Browse $catalogBox '模型目录|*.json' })
+$form.Controls.Add($browseCatalog)
+$notice=New-Object Windows.Forms.Label
+$notice.SetBounds(20,348,650,58)
+$notice.Text="每次切换会备份配置、会话数据库和现有会话文件，不改 auth.json。`r`n所有本地旧对话保留原 ID，并同步续聊路由、兼容字段与派生索引。`r`n可见消息、skills、MCP 均保留；务必先退出 Codex，成功后再重新打开。"
+$form.Controls.Add($notice)
+$progress=New-Object Windows.Forms.ProgressBar
+$progress.SetBounds(20,410,650,18)
+$progress.Minimum=0; $progress.Maximum=100
+$form.Controls.Add($progress)
+$officialButton=New-Object Windows.Forms.Button
+$officialButton.Text='切换到官方登录'; $officialButton.SetBounds(20,438,310,49)
+$deepseekButton=New-Object Windows.Forms.Button
+$deepseekButton.Text='切换到 DeepSeek'; $deepseekButton.SetBounds(350,438,320,49)
+$form.Controls.AddRange(@($officialButton,$deepseekButton))
+$status=New-Object Windows.Forms.Label
+$status.SetBounds(20,543,650,25); $form.Controls.Add($status)
+$monitorButton=New-Object Windows.Forms.Button
+$monitorButton.Text='请求去向监测 — 看这个对话到底发给了谁'
+$monitorButton.SetBounds(20,490,650,42)
+$monitorButton.Add_Click({ Show-Monitor })
+$form.Controls.Add($monitorButton)
+function Load-Settings {
+    try {
+        $dir=Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($configBox.Text))) 'codex-switcher'
+        $saved=Read-State $dir
+        if ($saved) { $baseBox.Text=$saved.apiBase; $modelBox.Text=$saved.model; $catalogBox.Text=$saved.catalog; $status.Text='上次切换：' + $saved.mode }
+        if (!$catalogBox.Text -or !(Test-Path -LiteralPath $catalogBox.Text -PathType Leaf)) {
+            $resolved = Resolve-DefaultCatalog $defaultHome ([IO.Path]::GetDirectoryName($script:SourceScript))
+            if ($resolved) { $catalogBox.Text = $resolved }
+        }
+    } catch { $status.Text='请选择有效的配置文件。' }
+}
+$configBox.Add_Leave({ Load-Settings })
+function Run-Switch([string]$Mode) {
+    try {
+        $officialButton.Enabled=$false; $deepseekButton.Enabled=$false; $monitorButton.Enabled=$false
+        $progress.Value=0
+        $status.Text='开始切换…'
+        $script:ProgressHandler = {
+            param($Percent,$Message)
+            try {
+                $script:progress.Value = [Math]::Max(0,[Math]::Min(100,[int]$Percent))
+                $script:status.Text = $Message
+                [Windows.Forms.Application]::DoEvents()
+            } catch { }
+        }
+        $message=Switch-Mode $configBox.Text $Mode $baseBox.Text.Trim() $modelBox.Text.Trim() $keyBox.Text.Trim() $catalogBox.Text.Trim()
+        $script:ProgressHandler = $null
+        $progress.Value=100
+        $keyBox.Clear()
+        [Windows.Forms.MessageBox]::Show($message,'Codex 配置切换','OK','Information') | Out-Null
+        Load-Settings
+    } catch {
+        [Windows.Forms.MessageBox]::Show($_.Exception.Message,'没有完成切换','OK','Error') | Out-Null
+    } finally {
+        $script:ProgressHandler=$null
+        $progress.Value=0
+        $officialButton.Enabled=$true; $deepseekButton.Enabled=$true; $monitorButton.Enabled=$true
+    }
+}
+$officialButton.Add_Click({ Run-Switch 'openai' })
+$deepseekButton.Add_Click({ Run-Switch 'deepseek' })
+Load-Settings
+
+$script:MonitorForm=$null; $script:MonitorBox=$null; $script:MonitorTimer=$null
+$script:MonitorState=$null; $script:MonitorToggle=$null; $script:MonitorLogPath=$null
+$script:MonitorFullBox=$null; $script:MonitorPaused=$false; $script:MonitorFull=$false; $script:MonitorLastId=''
+function Get-MonitorRoot {
+    return [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($configBox.Text))
+}
+function Update-Monitor {
+    param([switch]$Force)
+    if (!$script:MonitorBox -or $script:MonitorBox.IsDisposed) { return }
+    try {
+        $root = Get-MonitorRoot
+        $snapshot = Get-ProviderSnapshot -CodexRoot $root -Recent 6 -Full:$script:MonitorFull
+        if ($snapshot.LastId -and ($Force -or $snapshot.LastId -ne $script:MonitorLastId)) {
+            Add-ProviderWatchLog $root $snapshot
+            $script:MonitorLastId = $snapshot.LastId
+        }
+        $script:MonitorBox.Text = ($snapshot.Lines -join "`r`n")
+        $script:MonitorLogPath = Join-Path (Join-Path $root 'codex-switcher') 'provider-watch.log'
+        $state = '最后刷新 ' + (Get-Date -Format 'HH:mm:ss') + '   ' + $snapshot.Headline
+        if ($script:MonitorPaused) { $state = '[已暂停] ' + $state }
+        $script:MonitorState.Text = $state
+    } catch {
+        $script:MonitorBox.Text = '刷新失败：' + $_.Exception.Message
+        $script:MonitorState.Text = '刷新失败'
+    }
+}
+function Show-Monitor {
+    if ($script:MonitorForm -and !$script:MonitorForm.IsDisposed) {
+        $script:MonitorForm.Activate()
+        Update-Monitor
+        return
+    }
+    $script:MonitorBox = New-Object Windows.Forms.TextBox
+    $script:MonitorBox.Multiline=$true; $script:MonitorBox.ReadOnly=$true
+    $script:MonitorBox.WordWrap=$false; $script:MonitorBox.ScrollBars='Both'
+    $script:MonitorBox.Dock='Fill'
+    $script:MonitorBox.Font=New-Object Drawing.Font('Consolas',9.5)
+    $script:MonitorBox.BackColor=[Drawing.Color]::White
+    $panel=New-Object Windows.Forms.Panel
+    $panel.Dock='Bottom'; $panel.Height=46
+    $script:MonitorState=New-Object Windows.Forms.Label
+    $script:MonitorState.SetBounds(10,12,420,22)
+    $script:MonitorState.Text='准备中…'
+    $script:MonitorFullBox=New-Object Windows.Forms.CheckBox
+    $script:MonitorFullBox.Text='完整时间线（较慢）'; $script:MonitorFullBox.SetBounds(436,12,130,22)
+    $script:MonitorFullBox.Add_CheckedChanged({
+        $script:MonitorFull = $script:MonitorFullBox.Checked
+        Update-Monitor
+    })
+    $refreshButton=New-Object Windows.Forms.Button
+    $refreshButton.Text='立即刷新'; $refreshButton.SetBounds(572,8,96,30)
+    $refreshButton.Add_Click({ Update-Monitor -Force })
+    $script:MonitorToggle=New-Object Windows.Forms.Button
+    $script:MonitorToggle.Text='暂停监测'; $script:MonitorToggle.SetBounds(674,8,104,30)
+    $script:MonitorToggle.Add_Click({
+        $script:MonitorPaused = !$script:MonitorPaused
+        if ($script:MonitorPaused) { $script:MonitorToggle.Text='继续监测' } else { $script:MonitorToggle.Text='暂停监测' }
+        Update-Monitor
+    })
+    $logButton=New-Object Windows.Forms.Button
+    $logButton.Text='打开监测日志'; $logButton.SetBounds(784,8,110,30)
+    $logButton.Add_Click({
+        if ($script:MonitorLogPath -and (Test-Path -LiteralPath $script:MonitorLogPath)) {
+            Start-Process -FilePath $script:MonitorLogPath
+        } else {
+            [Windows.Forms.MessageBox]::Show('还没有日志。先让 Codex 产生一次对话，再点“立即刷新”。','请求去向监测','OK','Information') | Out-Null
+        }
+    })
+    $panel.Controls.AddRange(@($script:MonitorState,$script:MonitorFullBox,$refreshButton,$script:MonitorToggle,$logButton))
+    $script:MonitorForm=New-Object Windows.Forms.Form
+    $script:MonitorForm.Text='请求去向监测 — 谁在回答这个对话（只读）'
+    $script:MonitorForm.ClientSize=New-Object Drawing.Size(906,600)
+    $script:MonitorForm.StartPosition='CenterScreen'
+    $script:MonitorForm.MinimumSize=New-Object Drawing.Size(700,400)
+    $script:MonitorForm.Font=New-Object Drawing.Font('Microsoft YaHei UI',9)
+    $script:MonitorForm.Controls.AddRange(@($script:MonitorBox,$panel))
+    $script:MonitorTimer=New-Object Windows.Forms.Timer
+    $script:MonitorTimer.Interval=3000
+    $script:MonitorTimer.Add_Tick({ if (!$script:MonitorPaused) { Update-Monitor } })
+    $script:MonitorForm.Add_FormClosed({
+        if ($script:MonitorTimer) { $script:MonitorTimer.Stop(); $script:MonitorTimer.Dispose(); $script:MonitorTimer=$null }
+        $script:MonitorForm=$null; $script:MonitorBox=$null
+    })
+    $script:MonitorForm.Show($form)
+    $script:MonitorTimer.Start()
+    Update-Monitor
+}
+
+if ($UiSmoke) {
+    $smokeRoot = Join-Path ([IO.Path]::GetTempPath()) ('switcher-uismoke-' + [guid]::NewGuid().ToString('N'))
+    $smokeSessions = Join-Path $smokeRoot 'sessions\2026\10\16'
+    $null = New-Item -ItemType Directory -Path $smokeSessions -Force
+    $smokeConfig = Join-Path $smokeRoot 'config.toml'
+    Atomic-Write $smokeConfig "model = `"deepseek-v4-flash`"`r`nmodel_provider = `"deepseek`"`r`n[model_providers.deepseek]`r`nbase_url = `"https://api.deepseek.com`"`r`nwire_api = `"responses`"`r`n"
+    $smokeLines = @(
+        '{"timestamp":"2026-10-16T09:00:00Z","type":"session_meta","payload":{"id":"01a1smoke","session_id":"01a1smoke","model_provider":"deepseek"}}',
+        '{"timestamp":"2026-10-16T09:01:00Z","type":"token_usage_record","payload":{"thread_id":"01a1smoke","response_id":"resp_0f3d8267cc5b1a5c016ad0ab9693a8819985dc69670901d255"}}',
+        '{"timestamp":"2026-10-16T09:02:00Z","type":"token_usage_record","payload":{"thread_id":"01a1smoke","response_id":"8ca4c701-e67e-45ef-9e08-c40abadf3a56"}}'
+    )
+    [IO.File]::WriteAllText((Join-Path $smokeSessions 'rollout-01a1smoke.jsonl'), (($smokeLines -join "`r`n") + "`r`n"), $script:Utf8)
+    $configBox.Text = $smokeConfig
+    if ($form.Controls.Count -lt 18 -or !$catalogBox.Text) { throw 'UI validation failed' }
+    if (!$progress) { throw 'progress bar missing from the switch form' }
+    Show-Monitor
+    if (!$script:MonitorForm -or !$script:MonitorBox) { throw 'monitor window failed to open' }
+    $monitorText = $script:MonitorBox.Text
+    if ($monitorText -notmatch 'OpenAI官方\(resp_\)') { throw ('monitor missed official fingerprint: ' + $monitorText) }
+    if ($monitorText -notmatch 'UUID') { throw ('monitor missed third-party fingerprint: ' + $monitorText) }
+    if ($monitorText -notmatch '创建时模型') { throw ('monitor missed origin model: ' + $monitorText) }
+    if ($monitorText -match '完整时间线') { throw 'monitor full timeline should be off by default' }
+    $script:MonitorFullBox.Checked = $true
+    Update-Monitor -Force
+    $monitorText = $script:MonitorBox.Text
+    if ($monitorText -notmatch '完整时间线') { throw ('monitor missed timeline when enabled: ' + $monitorText) }
+    $smokeLog = Join-Path $smokeRoot 'codex-switcher\provider-watch.log'
+    if (!(Test-Path -LiteralPath $smokeLog)) { throw 'monitor did not write the watch log' }
+    $logText = [IO.File]::ReadAllText($smokeLog)
+    if ($logText -notmatch '8ca4c701-e67e-45ef-9e08-c40abadf3a56') { throw ('watch log missing response id: ' + $logText) }
+    if ($logText -notmatch 'provider=deepseek') { throw ('watch log missing provider: ' + $logText) }
+    $monitorChars = $monitorText.Length
+    $script:MonitorTimer.Stop()
+    $script:MonitorForm.Dispose()
+    Write-Output ('UI smoke PASS; controls=' + $form.Controls.Count + '; monitorChars=' + $monitorChars)
+    $form.Dispose()
+    return
+}
+[Windows.Forms.Application]::Run($form)
+$form.Dispose()

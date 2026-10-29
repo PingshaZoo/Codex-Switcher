@@ -243,6 +243,36 @@ public static class CodexSwitcherSqlite
         }
     }
 
+    public static long RestoreSkippedRoutes(string path, string backup, string[] paths, string[] ids)
+    {
+        IntPtr db = Open(path, ReadWrite);
+        try
+        {
+            Exec(db, "ATTACH DATABASE '" + backup.Replace("'", "''") + "' AS switcher_original");
+            Exec(db, "BEGIN IMMEDIATE");
+            long restored = 0;
+            for (int i = 0; i < paths.Length; i++)
+            {
+                string originalPath = paths[i].Replace('\\', '/').Replace("'", "''");
+                string id = i < ids.Length ? ids[i] : "";
+                string condition = "replace(rollout_path, char(92), '/')='" + originalPath + "'";
+                if (!string.IsNullOrEmpty(id)) condition += " OR id='" + id.Replace("'", "''") + "'";
+                // Relative rollout paths also occur in older databases.
+                int session = originalPath.IndexOf("/sessions/", StringComparison.OrdinalIgnoreCase);
+                if (session < 0) session = originalPath.IndexOf("/archived_sessions/", StringComparison.OrdinalIgnoreCase);
+                if (session >= 0) condition += " OR replace(rollout_path, char(92), '/')='" + originalPath.Substring(session + 1) + "'";
+                restored += ScalarInt64(db, "SELECT count(*) FROM threads WHERE " + condition);
+                Exec(db, "UPDATE threads SET model_provider=(SELECT b.model_provider FROM switcher_original.threads b WHERE b.id=threads.id),"
+                    + " model=(SELECT b.model FROM switcher_original.threads b WHERE b.id=threads.id),"
+                    + " reasoning_effort=(SELECT b.reasoning_effort FROM switcher_original.threads b WHERE b.id=threads.id) WHERE " + condition);
+            }
+            Exec(db, "COMMIT");
+            return restored;
+        }
+        catch { try { Exec(db, "ROLLBACK"); } catch { } throw; }
+        finally { sqlite3_close_v2(db); }
+    }
+
     public static bool HasProjectionTables(string path)
     {
         IntPtr db = IntPtr.Zero;

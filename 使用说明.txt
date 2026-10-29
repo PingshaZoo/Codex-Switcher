@@ -196,3 +196,24 @@ https://learn.chatgpt.com/docs/config-file/config-advanced
 https://learn.chatgpt.com/docs/enterprise/connect-to-a-gateway
 https://api-docs.deepseek.com/quick_start/agent_integrations/codex/
 https://api-docs.deepseek.com/
+
+
+2026-10-29 修复与诊断日志
+-----------------------
+通过 Start.cmd 启动。启动器 Start-Switcher.ps1 会捕获脚本加载、解析及界面初始化异常。
+启动日志：%LOCALAPPDATA%\Codex-Switcher\logs\runtime.log
+正常运行/切换日志：所选 config.toml 同目录下的 codex-switcher\runtime.log
+目录不能写入时回退到启动日志；界面报错会显示实际日志位置。
+运行日志包含时间、进程号、切换阶段、异常堆栈、回滚结果；API Key 会被隐藏。
+运行日志超过 5 MB 时保留一个 .1 备份。原有 switch.log 和 switch-timing.log 继续保留。
+
+官方模型解析现在支持只有 eligible_codex_model_slugs 的缓存；无缓存时不再接受
+DeepSeek 或上次第三方模型作为官方模型。若没有任何官方模型记录，按提示在模型栏
+填写明确的 gpt-* 官方模型名称；工具不会猜测账号可用模型。
+需要先退出 Codex / ChatGPT 后切换，避免运行中的应用覆盖配置和数据库。
+
+修复：密钥/模型目录/状态随切换失败一起回滚；状态备份先于会话迁移；支持带引号的
+简单 TOML 根键；跳过损坏会话时还原对应索引路由；监控不再用全局默认冒充历史去向。
+回归测试：Windows PowerShell 运行 tests\Test-OfficialSwitch.ps1、
+tests\Test-DamagedSessions.ps1、tests\Test-Reliability.ps1。
+新增可靠性测试使用 Python 标准库 sqlite3 交叉校验数据库；程序运行本身不依赖 Python。

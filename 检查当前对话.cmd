@@ -1,6 +1,7 @@
 @echo off
-chcp 65001 >nul
-echo.
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Check-Provider.ps1" %*
-echo.
+setlocal
+cd /d "%~dp0"
+python -X utf8 "%~dp0start_switcher.py" check --full %*
+set "switcher_exit=%errorlevel%"
 pause
+exit /b %switcher_exit%

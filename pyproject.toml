@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-provider-switcher"
+version = "2.0.0"
+description = "Windows Codex provider switcher with recoverable local history migration"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+codex-switcher = "codex_switcher.cli:main"
+
+[tool.setuptools]
+packages = ["codex_switcher"]

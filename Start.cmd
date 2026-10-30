@@ -1,5 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -STA -ExecutionPolicy Bypass -File "%~dp0Start-Switcher.ps1"
-if errorlevel 1 pause
+python -X utf8 "%~dp0start_switcher.py" %*
+set "switcher_exit=%errorlevel%"
+if not "%switcher_exit%"=="0" pause
+exit /b %switcher_exit%

@@ -1,243 +1,31 @@
-Codex 官方登录 / DeepSeek 一键切换工具（Windows）
+Codex 多供应商切换 · Python 版
+=============================
 
-一、怎么用
-1. 将整个文件夹解压到固定位置。不要只复制 Start.cmd。
-2. 正常退出 Codex / ChatGPT 桌面应用和 Codex 命令行。
-3. 双击 Start.cmd。Windows 自带 PowerShell 即可，不用安装 Python。
-4. 配置文件默认是当前用户的 .codex\config.toml；如你有自定义 CODEX_HOME，默认使用它。
-   “选择文件”用于选择当前生效的配置，不是选择旧备份覆盖当前配置。
-5. 首次使用时，应从已经完成 ChatGPT 官方登录的配置开始。
-6. 点击“切换到 DeepSeek”前，首次填写你的 DeepSeek API Key。
-   模型默认 deepseek-v4-flash；接口默认 https://api.deepseek.com。
-   必须使用支持 Codex 所需 Responses API 的接口，仅兼容 Chat Completions 并不够。
-   模型名称可以自由填写：DeepSeek 以后发布新模型，直接填新名称即可，不需要改工具。
-   也可以一次填多个，用逗号分隔，例如 deepseek-v4-flash,deepseek-v4-pro；
-   第一个是本次生效的模型，其余会补进模型目录，方便在对话的模型列表里直接切换。
-   工具会把新模型自动写进“模型目录 JSON”指向的文件，并同步到生效副本
-   codex-switcher\deepseek-models.json；原文件每次修改前都备份到
-   codex-switcher\catalog-backups\。目录里已有的模型会出现在 Codex 的模型选择列表里。
-   为什么需要目录：官方模型的元数据（上下文窗口、推理档位、工具能力、显示名）由服务器下发，
-   第三方接口没有这个服务端目录，只能由本地目录文件提供；目录缺失时模型列表是空的。
-   新补进来的模型条目只是本地声明，接口是否真的提供该模型仍由 DeepSeek 决定。
-   工具自带的目录里已有 deepseek-v4-flash、deepseek-v4-pro、deepseek-v4-flash-vision-exp，
-   切换后可以直接在对话的模型列表里选；你填的新名称会继续追加进去。目录条目必须带完整能力
-   元数据，否则 Codex 起不来；工具补的新条目会按自带条目自动补全，并在目录本身缺字段时提醒你。
-   当前官方推荐名称是 deepseek-flash；deepseek-v4-flash 是仍被接受的旧别名，
-   请求由当前 Flash 模型处理。本工具按你的要求保留旧别名，不代表锁定旧版模型权重。
-7. 显示成功后，重新打开 Codex。
-8. 要回官方模式：退出 Codex，再双击 Start.cmd，点击“切换到官方登录”。
-   工具会把默认 provider 及全部本地旧会话切回 OpenAI；DeepSeek provider 定义和加密凭证仍会保留。
-   官方登录的配置里通常没有 model / model_provider（模型由服务器下发），所以工具按以下顺序决定
-   旧会话改用的官方模型：
-     ① 保存下来的官方配置里写的 model；
-     ② 上次切走官方时记录下来的官方模型（state.json 的 officialModel）；
-     ③ 你在“模型名称”栏里填写的官方模型名（例如 gpt-5.6-sol；填第三方模型名会被忽略）；
-     ④ 本机 Codex 记录的默认官方模型：.codex-global-state.json 的 default_model_slug（自动去掉 -wm 后缀），
-        读取不到时退回 models_cache.json 里优先级最高的可见模型。
-   四处都取不到时会直接报错并保持配置不变，并提示你先在 Codex 里登录官方账号选一次模型，
-   或直接在第 2 栏填写要迁移到的官方模型名。
-   切回官方后再想改用别的官方模型：重新打开 Codex，在对话框上方的模型列表里选一次即可。
+环境：Windows + Python 3.11 或更高版本（含 Tkinter），无需 pip 安装第三方库。
+双击 Start.cmd 打开中文界面；详细用法、备份恢复和测试命令见 README.md。
 
-二、保留哪些内容
-不替换 auth.json，不注销 ChatGPT，不复制或清空整个 .codex 文件夹。
-不删除历史对话，不修改 skills、MCP、插件和项目信任设置。
-切换时会更换模型相关配置，并把本机所有提供商来源的旧会话统一迁移到目标 provider / model。
-迁移会同步修改 state_*.sqlite 与现有会话文件中的当前 provider/model/reasoning 路由；
-不会更换会话 ID，也不会删除可见的用户消息、助手回答或工具输出。
-为了让旧会话能被目标提供商继续，工具会清理无法跨提供商复用的隐藏推理密文/标识；
-每次切换前均保留完整备份。
-首次配置后会保留工具自己的 DeepSeek 提供商段。
-官方模式使用首次切换前保存的官方模型配置。
-在官方模式修改设置后，再切换 DeepSeek，会重新保存最新的官方模型配置。
-官方配置里没有 model 时，工具会把当时应用正在使用的官方模型记到 state.json 的 officialModel，
-下次切回官方直接复用，不再依赖官方配置里是否写了 model。
-在任一模式新增的 MCP / skills / 插件设置，下次切换也会保留。
-MCP 的配置保留不代表 DeepSeek 与官方模型拥有完全相同的工具使用能力。
+1. 先正常退出 Codex / ChatGPT 桌面应用和 Codex 命令行。
+2. 确认生效的 config.toml。默认使用 CODEX_HOME，否则使用当前用户的 .codex。
+3. 首次使用应从已登录官方账号的配置开始，以保存官方模型设置。
+4. 点击“新增”，填写供应商 ID、名称、HTTPS 接口、API Key 和模型列表。
+5. “保存修改”只保存档案；“切换到所选供应商”才会应用配置。
+6. 密钥留空沿用原密钥；填写新密钥则更新。已保存 ID 固定，名称和其它字段可修改。
+7. 可选模型目录必须是对应供应商提供的完整能力目录 JSON，不会套用其它供应商模板。
+8. 默认不迁移历史。只有勾选“同时迁移全部历史会话”才会改写旧会话和数据库。
+9. 成功后重新打开 Codex。切回官方使用“切换到官方登录”。
 
-三、关于“以前的对话继续”
-历史对话不会被删除。每次切换时，本工具会将所有本地旧会话（OpenAI、DeepSeek、custom、newapi 等）
-的“下一次续聊使用的 provider/model/reasoning”统一改为目标模式，同时保留原会话 ID 和可见历史消息。
-工具还会重算 fork 会话的历史字节偏移，并使 Codex 的历史投影缓存失效，让应用重启后从已迁移的会话文件重建索引。
-所以不需要先 copy 或 fork：关闭 Codex、完成切换并重新打开后，可以直接打开原会话续聊。
-copy/fork 仍可正常使用，新分支会继承切换后的当前会话设置。
+密钥继续用 Windows 当前用户 DPAPI 加密，兼容旧 PowerShell 版本的档案和密文。
+运行时已完全改为 Python，不再依赖 PowerShell、C# 编译或第三方 SQLite DLL。
+Python 解释器必须保留在切换时的位置，Codex 会通过该解释器调用配置旁的独立凭证助手。
+更换 Python 安装路径后，重新运行本工具并应用一次配置。
 
-本工具只转换本地 Codex 状态；云端对话、远程主机、其他 Windows 账号或受组织管理的工作区
-不一定由这份 .codex 数据控制。工具会处理已知的 Responses 历史兼容字段，但第三方接口实现变化仍可能造成单个会话无法续聊。
-图片、供应商私有内容或未来新增的历史项目类型是否兼容，最终取决于目标 API；失败时可用当次完整备份恢复。
-遇到这种少数情况，可切回原提供商，或先做交接摘要后新建会话。
+双击“检查当前对话.cmd”只读查看最近会话；支持 -ScanAll 参数查看全部会话。
+图形监测支持每 3 秒刷新、暂停、完整时间线、日志。
+响应 ID 仅能分类格式，不能单独证明后端身份；当前配置也不能证明历史请求去向。
 
-四、怎么确认请求真的发给了哪家模型
-方式一（推荐，图形界面）：双击 Start.cmd，点“请求去向监测 — 看这个对话到底发给了谁”。
-监测窗口每 3 秒自动刷新，只读，不修改任何文件；Codex 正在运行时也能用，不需要退出 Codex。
-  - 分两行显示“新对话默认模型/来源”（来自 config.toml，只影响新建对话）和
-    “本对话实际模型/provider/推理强度”（来自会话运行时记录，就是对话框里选的那个），
-    两者不一致时会直接给出提示；
-  - 显示接口地址 / 认证方式；
-  - 显示本对话最近若干次请求的“响应 ID”，并直接给出结论；
-  - 勾选“完整时间线（较慢）”可以看到历史上每一段分别由谁回答、切换发生在什么时间点；
-  - “打开监测日志”查看落盘记录。
-每次出现新的响应 ID，工具都会往 codex-switcher\provider-watch.log 追加一行
-（时间、provider、model、接口地址、会话 ID、响应 ID、对话模型）。这就是“我到底向谁发了请求”的持续记录，
-切换回官方之后再发消息，日志里会接着出现 provider=openai 的行。
+每次应用前的备份：config.toml 同目录 codex-switcher/profile-backups/。
+运行日志：codex-switcher/runtime.log，启动失败日志：%LOCALAPPDATA%/Codex-Switcher/logs/runtime.log。
+失败时会尝试恢复同批配置、档案、密钥、目录和会话；若恢复失败，错误会显示备份路径。
+备份可能含 MCP 凭证和完整对话，勿公开分享。
 
-方式二（命令行）：双击“检查当前对话.cmd”。它会输出：
-1. 当前配置里的 provider / model / 接口地址 / 认证方式；
-2. 本对话每次请求的“响应 ID”时间线。
-
-响应 ID 由对方服务器签发，本切换工具从不修改它，所以可以当指纹用：
-  resp_ 开头 + 一长串十六进制  -> OpenAI 官方 Responses 接口
-  标准 UUID（8-4-4-4-12 带横杠）-> 第三方接口（DeepSeek 侧）
-两种方式都会给出结论，并额外打印“创建时的模型”（取自会话头的 provenance，
-同样不被切换工具修改）用于交叉验证。想看全部会话：在 PowerShell 中运行
-  powershell -ExecutionPolicy Bypass -File Check-Provider.ps1 -ScanAll
-
-另外两种可以互相印证的确认方式：
-A. Clash Verge 的“连接”页：发一条消息，看目标域名是 api.deepseek.com 还是 chatgpt.com。
-   Codex 的全部流量都走 Clash，所以“连上了 Clash”本身不能说明提供商，必须看目标域名。
-B. 平台用量页：DeepSeek 官网的用量信息页能看到 token 消耗。
-   OpenAI 官方登录用的是 ChatGPT 账号（不是 API Key 计费），platform.openai.com 的用量页
-   通常看不到这些请求，此时以响应 ID 指纹加 Clash 目标域名为准。
-
-五、密钥和备份
-密钥用 Windows 当前用户的 DPAPI 加密，存于所选配置文件旁：
-codex-switcher\deepseek.key
-不能把加密密钥直接复制给另一个 Windows 账号或电脑使用；到新电脑请重新填写 Key。
-工具使用 Codex 的命令认证功能，辅助脚本自动复制到 codex-switcher\credential-helper.ps1。
-这个辅助脚本只会向 Codex 返回解密后的 Key，不在界面或日志显示。
-切回官方后仍保留加密密钥，以便以后再切换。
-
-每次更改前的完整 config.toml 备份：codex-switcher\backups\
-每次迁移前的数据库和会话文件备份：codex-switcher\chat-backups\
-自动补充模型目录前的备份：codex-switcher\catalog-backups\
-切换状态：codex-switcher\state.json
-操作日志：codex-switcher\switch.log（不含 API Key）
-配置备份可能包含你原来已有的 MCP 凭证，请不要将备份分享给别人。
-chat-backups 每个子目录包含迁移清单 manifest.json、SQLite 一致性备份和对应 rollout 文件。
-脚本遇到错误会自动尝试恢复本次修改。手工恢复前务必退出 Codex，并同时恢复同一时间点的
-config.toml、state_*.sqlite 和 rollouts，避免配置与会话索引不一致。
-
-六、切换要多久、慢在哪、怎么看耗时
-切换时会自动备份配置、会话数据库和会话文件，所以耗时基本与“全部会话总大小”成正比，
-与对话条数、单条对话的长短直接相关。典型耗时（本机 21.6 MB 会话实测）：
-  备份 + SQLite 索引 + fork 修复 + 投影缓存：约 0.7 秒
-  逐条会话改写：与总大小成正比，约 0.1 秒/MB
-点击切换后主窗口会显示进度条和当前阶段，请等它走完，不要反复点击。
-
-每次切换的耗时明细会追加写入 codex-switcher\switch-timing.log，例如：
-  改写会话 2/6  1118.0 ms  7.5 MB，路由 4，兼容 288
-  合计 3.32 秒
-这条日志就是“慢在哪”的答案：哪一步、哪个会话、多少 MB、改了多少处，一目了然。
-切换结果弹窗也会显示总耗时。
-
-性能说明：本版的会话改写引擎已从 PowerShell 换成 C#（ChatMigration.cs）。
-原先每行都要走 PowerShell 的 JSON 解析和无用递归，13 MB 的会话要 107 秒；
-现在同样文件约 1 秒，整体由 158 秒降到约 3.3 秒（约 48 倍）。
-没有改动的行按原字节原样写回，只有真正改动的行会被重新序列化。
-如果以后会话变得很大（例如单个文件超过 100 MB），耗时仍会随体积线性增长，
-此时可用 switch-timing.log 确认是哪一类会话在占时间。
-
-七、遇到问题
-“请先退出”：正常退出桌面应用及 Codex 命令行；工具不会强制结束任务。
-“Model provider `deepseek` not found”：先退出 Codex，使用本版工具完成一次目标模式切换再重新打开。
-本工具既保留 DeepSeek provider 定义，也会转换全部本地旧会话的当前 provider/model。
-“无法解锁密钥”：在原 Windows 用户下重新填写 DeepSeek Key。
-404 / Responses 不支持：你的接口不支持 Codex 所需协议，单靠此切换工具无法转换协议。
-模型不可用：检查你的账号是否有该模型权限，以及接口是否真的提供该模型名称。
-换别的 DeepSeek 模型报“目录里没有选定模型”：旧版校验会拦截，本版已改为自动补进目录；
-填写的模型会写入“模型目录 JSON”指向的文件并同步到生效副本，原文件备份在 catalog-backups。
-模型列表里看不到某个模型：确认该模型已存在于当前“模型目录 JSON”指向的文件里，
-必要时把这一栏指向你自己的 models.json，或直接用逗号把多个模型一起填写后再切换。
-会话文件损坏或为空（例如报错“会话文件首行不是有效 JSON”）：工具会跳过这个文件并继续切换，
-  不会因为一个坏文件中止整次切换。被跳过的文件会列在切换结果里，同时记入
-  codex-switcher\switch.log；跳过意味着不迁移、也不修改它，其它会话照常处理。
-  常见原因是那次会话异常退出，留下 0 字节或首行写了一半的 rollout-*.jsonl，这种文件可以直接删除。
-  想先看清本机有哪些会话文件，可运行：检查当前对话.cmd -ScanAll
-会话文件最后一行写到一半（首行正常、后续行不完整）：同样只跳过这一个文件（原因显示为“改写失败”），
-  其它会话照常迁移。只有数据库或投影缓存出错时才会整体回滚；如果所有会话文件都改写失败，
-  工具会当成系统性问题整体回滚并报错。
-被跳过的会话在应用里可能打不开（文件本身已经坏了），这不影响其它会话；删掉坏文件后重新运行切换即可。
-官方模式要求登录：在 Codex 中正常完成 ChatGPT 登录即可；工具不会替你登录。
-“未找到本工具保存的官方配置”：第 1 栏选的 config.toml 不是当前生效的那份（工具在它旁边找
-  codex-switcher\state.json），或这台机器没用本工具切换过。按提示在 Codex 里正常登录官方账号、
-  把配置里的第三方 model_provider / model / model_catalog_json 行删掉后重试。
-“无法确定官方模式下旧会话应该用哪个模型”：官方配置里没有 model，本机也读不到 Codex 的官方模型记录。
-  先在 Codex 里登录官方账号并选一次模型，再运行本工具；或在“模型名称”栏里填写官方模型名后点“切换到官方登录”。
-  这种情况工具不会修改任何文件。
-生成的 config.toml 出现重复顶层配置项：工具会取消本次切换并保留原文件，请把报错里的键删掉一行后重试。
-企业安全策略禁止脚本：请联系管理员；工具不会修改系统执行策略或要求管理员权限。
-TOML 多行字符串：为避免误删复杂配置，工具会拒绝编辑，保留原文件。
-本工具适用于支持 model_providers.<id>.auth 命令认证的新版 Codex。
-
-八、验证范围
-已验证：模拟配置往返切换、重复切换、官方设置恢复、MCP/skills 内容保留、auth.json 不变、
-密钥 DPAPI 加解密、操作备份、旧 HTTP 转发地址拒绝、复杂 TOML 保护；
-OpenAI/DeepSeek/custom/newapi 会话批量迁移、原会话 ID 与可见历史保留、兼容字段转换、fork 偏移修复、投影缓存重建、数据库与会话文件恢复；
-请求去向自查工具在真实会话与真实会话数据库上验证过（只读）。
-回归测试覆盖：响应 ID 指纹识别、尾部窗口与完整时间线、创建时模型交叉验证、
-切换不会改写服务端签发的响应 ID、监测窗口界面与监测日志落盘。
-官方往返回归测试（tests\Test-OfficialSwitch.ps1，用 Windows PowerShell 运行，只操作 %TEMP% 临时目录）覆盖：
-官方配置（有无 model 两种情况）与 DeepSeek 的往返还原、切走官方时记住官方模型、去掉 -wm 后缀、
-本机无官方模型线索时的报错与“不修改文件”、模型名称栏指定官方模型、第三方模型名被忽略、
-反复切换不产生重复顶层键、web_search 等托管根键不残留。
-损坏会话回归测试（tests\Test-DamagedSessions.ps1，同样只操作 %TEMP%）覆盖：
-空文件、首行截断、首行不是 session_meta、首行缺 model_provider 四种坏文件的识别与跳过、
-跳过时坏文件字节不变、健康会话照常迁移、switch.log 记录跳过项，以及正反两个方向都能完成切换。
-另覆盖：模型名多值拆分、新模型自动补进目录并去重、目录写入前的备份、
-对话运行时模型（turn_context / thread_settings_applied）识别，
-以及“默认模型”与“本对话实际模型”不一致时的提示。
-性能改造另有专门的等价性测试：在 11 个文件（含 13.2 MB 与 7.5 MB 真实会话）上，
-C# 引擎与改造前已验证的 PowerShell 参考实现逐行等价，且统计的改动行数与实际字节变化行数一致；
-并用真实 Codex app-server 复验迁移后能正常恢复。
-测试不会替你切换真实配置，也没有使用你的 DeepSeek Key 发起推理调用。
-实际服务能否完成推理与工具调用，取决于所填接口和账号。
-
-官方参考：
-https://learn.chatgpt.com/docs/config-file/config-advanced
-https://learn.chatgpt.com/docs/enterprise/connect-to-a-gateway
-https://api-docs.deepseek.com/quick_start/agent_integrations/codex/
-https://api-docs.deepseek.com/
-
-
-2026-10-29 修复与诊断日志
------------------------
-通过 Start.cmd 启动。启动器 Start-Switcher.ps1 会捕获脚本加载、解析及界面初始化异常。
-启动日志：%LOCALAPPDATA%\Codex-Switcher\logs\runtime.log
-正常运行/切换日志：所选 config.toml 同目录下的 codex-switcher\runtime.log
-目录不能写入时回退到启动日志；界面报错会显示实际日志位置。
-运行日志包含时间、进程号、切换阶段、异常堆栈、回滚结果；API Key 会被隐藏。
-运行日志超过 5 MB 时保留一个 .1 备份。原有 switch.log 和 switch-timing.log 继续保留。
-
-官方模型解析现在支持只有 eligible_codex_model_slugs 的缓存；无缓存时不再接受
-DeepSeek 或上次第三方模型作为官方模型。若没有任何官方模型记录，按提示在模型栏
-填写明确的 gpt-* 官方模型名称；工具不会猜测账号可用模型。
-需要先退出 Codex / ChatGPT 后切换，避免运行中的应用覆盖配置和数据库。
-
-修复：密钥/模型目录/状态随切换失败一起回滚；状态备份先于会话迁移；支持带引号的
-简单 TOML 根键；跳过损坏会话时还原对应索引路由；监控不再用全局默认冒充历史去向。
-回归测试：Windows PowerShell 运行 tests\Test-OfficialSwitch.ps1、
-tests\Test-DamagedSessions.ps1、tests\Test-Reliability.ps1。
-新增可靠性测试使用 Python 标准库 sqlite3 交叉校验数据库；程序运行本身不依赖 Python。
-
-多供应商版（2026-10-29）
-=======================
-本节替代前文“每次切换统一迁移所有旧对话”的旧版说明。
-1. 点击“新增”，填写唯一 ID（小写字母开头，如 mimo）、显示名称、HTTPS base_url、
-   API Key、模型列表（逗号分隔，第一个为默认模型）。可选供应商官方模型能力目录 JSON。
-2. 点击“保存修改”只保存档案；点击“切换到所选供应商”会保存并应用到 Codex。
-3. 下次启动直接在“已保存的供应商”选择。接口、名称、模型和目录均可修改。
-   ID 保存后固定；API Key 留空沿用原密钥，输入新值则更新该供应商密钥。
-4. “获取模型”通过 base_url/models 获取 data[].id。返回列表可以修改、调整顺序；
-   获取失败可以手动填写。成功获取列表不代表 Responses 推理或工具调用已通过验证。
-5. “切换到官方登录”恢复保存的官方根配置，不清空 auth.json 或其它供应商定义。
-6. 默认不改写历史文件。旧对话保留原供应商记录，但具体客户端能否继续使用原路由取决于
-   Codex 版本。需要强制将全部旧会话迁到目标时，勾选“同时迁移全部历史会话”；跨供应商
-   会损失部分推理状态，且目标 API 不一定支持所有旧历史类型。此选项默认关闭。
-7. 旧版 state.json + deepseek.key 会自动导入一个 DeepSeek 档案。旧版只存了最后一家，
-   因此更早被覆盖的其它供应商信息不能凭空恢复。
-
-档案：config.toml 同目录的 codex-switcher/providers.json（密钥为当前用户 DPAPI 密文）。
-生效密钥：codex-switcher/keys/<id>.key；生效模型目录：codex-switcher/catalogs/<id>.json。
-每次应用前保存 profile-backups/<时间-随机ID>/files.json 和对应文件；可选会话备份在 chats/。
-配置、档案、密钥和目录写入失败会尝试一起回滚。运行诊断仍写 runtime.log。
-切换前先退出 Codex；成功后重启。供应商必须支持 Responses API，不是只有 Chat Completions。
-MiMo 等供应商应选用其官方模型能力目录，不要套用 DeepSeek 模板；本工具不会替你推测能力。
+原 PowerShell / C# 版本和测试已归档到 legacy/，不参与新版运行。
